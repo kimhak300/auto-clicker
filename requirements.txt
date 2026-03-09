@@ -1,0 +1,9 @@
+customtkinter
+pyautogui
+pynput
+Pillow
+keyboard
+opencv-python
+screeninfo
+selenium
+webdriver-manager
