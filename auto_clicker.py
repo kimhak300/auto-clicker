@@ -205,6 +205,7 @@ class AutoClickerPro(ctk.CTk):
         self._record_start = 0
         self._mouse_listener = None
         self._kb_listener = None
+        self._last_move_t = 0
         self.web_driver = None
         self.macro_steps = []
         self.scheduled_tasks = []
@@ -506,12 +507,37 @@ class AutoClickerPro(ctk.CTk):
 
         rec_opt = ctk.CTkFrame(tab)
         rec_opt.pack(fill="x", padx=12, pady=4)
-        self.rec_mouse_var = ctk.BooleanVar(value=True)
+        self.rec_click_var = ctk.BooleanVar(value=True)
+        self.rec_move_var = ctk.BooleanVar(value=False)
+        self.rec_scroll_var = ctk.BooleanVar(value=True)
         self.rec_kb_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(rec_opt, text="Mouse",
-                        variable=self.rec_mouse_var).pack(side="left", padx=8)
+        ctk.CTkCheckBox(rec_opt, text="Clicks",
+                        variable=self.rec_click_var).pack(side="left", padx=6)
+        ctk.CTkCheckBox(rec_opt, text="Mouse Move",
+                        variable=self.rec_move_var).pack(side="left", padx=6)
+        ctk.CTkCheckBox(rec_opt, text="Scroll",
+                        variable=self.rec_scroll_var).pack(side="left", padx=6)
         ctk.CTkCheckBox(rec_opt, text="Keyboard",
-                        variable=self.rec_kb_var).pack(side="left", padx=8)
+                        variable=self.rec_kb_var).pack(side="left", padx=6)
+
+        # Manual insert buttons
+        insert_f = ctk.CTkFrame(tab)
+        insert_f.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(insert_f, text="Insert:", text_color="gray60").pack(
+            side="left", padx=4)
+        ctk.CTkButton(insert_f, text="+ Wait", width=70,
+                      fg_color="gray30", command=self._rec_insert_wait
+                      ).pack(side="left", padx=3)
+        ctk.CTkButton(insert_f, text="+ Type Text", width=90,
+                      fg_color="gray30", command=self._rec_insert_type
+                      ).pack(side="left", padx=3)
+        ctk.CTkButton(insert_f, text="+ Image Click", width=100,
+                      fg_color="gray30", command=self._rec_insert_image
+                      ).pack(side="left", padx=3)
+        ctk.CTkButton(insert_f, text="Delete Selected", width=110,
+                      fg_color="#7f1d1d", hover_color="#991b1b",
+                      command=self._rec_delete_selected
+                      ).pack(side="right", padx=3)
 
         list_frame = ctk.CTkFrame(tab)
         list_frame.pack(fill="both", expand=True, padx=12, pady=4)
@@ -558,16 +584,23 @@ class AutoClickerPro(ctk.CTk):
         self.recorded_events = []
         self.recording = True
         self._record_start = time.time()
+        self._last_move_t = 0
         self.rec_btn.configure(text=f"Stop Recording ({HOTKEY_RECORD})")
         self._log("Recording... Press " + HOTKEY_RECORD + " to stop.")
 
         hotkeys = {HOTKEY_START_STOP.lower(), HOTKEY_RECORD.lower(),
                    HOTKEY_PICK.lower()}
+        rec_clicks = self.rec_click_var.get()
+        rec_moves = self.rec_move_var.get()
+        rec_scroll = self.rec_scroll_var.get()
 
-        if self.rec_mouse_var.get():
-            def on_mouse(x, y, button, pressed):
+        # Mouse listeners
+        if rec_clicks or rec_moves or rec_scroll:
+            def on_click(x, y, button, pressed):
                 if not self.recording:
                     return False
+                if not rec_clicks:
+                    return
                 if pressed:
                     t = round(time.time() - self._record_start, 3)
                     btn = button.name if hasattr(button, 'name') else str(button)
@@ -576,9 +609,38 @@ class AutoClickerPro(ctk.CTk):
                     self.recorded_events.append(evt)
                     self.rec_tree.insert(
                         "", "end",
-                        values=(f"{t}s", "Mouse", f"Click ({x},{y}) {btn}"))
+                        values=(f"{t}s", "Click", f"({x},{y}) {btn}"))
 
-            self._mouse_listener = pynput_mouse.Listener(on_click=on_mouse)
+            def on_move(x, y):
+                if not self.recording or not rec_moves:
+                    return
+                now = time.time()
+                if now - self._last_move_t < 0.05:
+                    return
+                self._last_move_t = now
+                t = round(now - self._record_start, 3)
+                evt = {"t": t, "type": "mouse_move", "x": x, "y": y}
+                self.recorded_events.append(evt)
+                self.rec_tree.insert(
+                    "", "end",
+                    values=(f"{t}s", "Move", f"({x},{y})"))
+
+            def on_scroll(x, y, dx, dy):
+                if not self.recording or not rec_scroll:
+                    return
+                t = round(time.time() - self._record_start, 3)
+                evt = {"t": t, "type": "mouse_scroll",
+                       "x": x, "y": y, "dx": dx, "dy": dy}
+                self.recorded_events.append(evt)
+                direction = "up" if dy > 0 else "down"
+                self.rec_tree.insert(
+                    "", "end",
+                    values=(f"{t}s", "Scroll", f"({x},{y}) {direction} {abs(dy)}"))
+
+            self._mouse_listener = pynput_mouse.Listener(
+                on_click=on_click if rec_clicks else None,
+                on_move=on_move if rec_moves else None,
+                on_scroll=on_scroll if rec_scroll else None)
             self._mouse_listener.start()
 
         if self.rec_kb_var.get():
@@ -634,15 +696,44 @@ class AutoClickerPro(ctk.CTk):
                     if wait > 0:
                         time.sleep(wait)
                     prev_t = evt["t"]
-                    if evt["type"] == "mouse_click":
+                    etype = evt["type"]
+
+                    if etype == "mouse_click":
                         pyautogui.click(
                             evt["x"], evt["y"],
                             button=evt.get("button", "left"))
-                    elif evt["type"] == "key_press":
+                    elif etype == "mouse_move":
+                        pyautogui.moveTo(evt["x"], evt["y"])
+                    elif etype == "mouse_scroll":
+                        clicks = evt.get("dy", 0)
+                        pyautogui.scroll(
+                            clicks, x=evt.get("x"), y=evt.get("y"))
+                    elif etype == "key_press":
                         try:
                             pyautogui.press(evt["key"])
                         except Exception:
                             pyautogui.write(evt["key"])
+                    elif etype == "type_text":
+                        pyautogui.write(
+                            evt.get("text", ""),
+                            interval=float(evt.get("interval", 0.02)))
+                    elif etype == "wait":
+                        time.sleep(float(evt.get("seconds", 1)))
+                    elif etype == "image_click":
+                        img = evt.get("image", "")
+                        conf = float(evt.get("confidence", 0.8))
+                        timeout = float(evt.get("timeout", 10))
+                        deadline = time.time() + timeout
+                        while time.time() < deadline and self.running:
+                            try:
+                                loc = pyautogui.locateCenterOnScreen(
+                                    img, confidence=conf)
+                                if loc:
+                                    pyautogui.click(loc[0], loc[1])
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(0.5)
                 if not self.running:
                     break
             self.running = False
@@ -675,19 +766,99 @@ class AutoClickerPro(ctk.CTk):
         with open(path) as f:
             self.recorded_events = json.load(f)
         for evt in self.recorded_events:
-            if evt["type"] == "mouse_click":
-                detail = (f"Click ({evt['x']},{evt['y']}) "
-                          f"{evt.get('button', 'left')}")
-            else:
-                detail = evt.get("key", "")
-            self.rec_tree.insert(
-                "", "end",
-                values=(f"{evt['t']}s",
-                        "Mouse" if evt["type"] == "mouse_click" else "Key",
-                        detail))
+            self._rec_tree_insert(evt)
         self._log(
             f"Loaded {len(self.recorded_events)} events "
             f"from {os.path.basename(path)}")
+
+    def _rec_evt_display(self, evt):
+        """Return (type_label, detail) for a recorded event."""
+        etype = evt["type"]
+        if etype == "mouse_click":
+            return "Click", f"({evt['x']},{evt['y']}) {evt.get('button','left')}"
+        elif etype == "mouse_move":
+            return "Move", f"({evt['x']},{evt['y']})"
+        elif etype == "mouse_scroll":
+            d = "up" if evt.get("dy", 0) > 0 else "down"
+            return "Scroll", f"({evt['x']},{evt['y']}) {d} {abs(evt.get('dy',0))}"
+        elif etype == "key_press":
+            return "Key", evt.get("key", "")
+        elif etype == "type_text":
+            txt = evt.get("text", "")
+            preview = txt[:40] + "..." if len(txt) > 40 else txt
+            return "Type", preview
+        elif etype == "wait":
+            return "Wait", f"{evt.get('seconds', 1)}s"
+        elif etype == "image_click":
+            return "ImgClick", os.path.basename(evt.get("image", ""))
+        return etype, ""
+
+    def _rec_tree_insert(self, evt):
+        label, detail = self._rec_evt_display(evt)
+        self.rec_tree.insert("", "end",
+                             values=(f"{evt['t']}s", label, detail))
+
+    def _rec_last_time(self):
+        if self.recorded_events:
+            return self.recorded_events[-1]["t"]
+        return 0.0
+
+    def _rec_insert_wait(self):
+        dlg = ctk.CTkInputDialog(
+            text="Wait duration (seconds):", title="Insert Wait")
+        val = dlg.get_input()
+        if not val:
+            return
+        try:
+            secs = float(val)
+        except ValueError:
+            return
+        t = round(self._rec_last_time() + 0.01, 3)
+        evt = {"t": t, "type": "wait", "seconds": secs}
+        self.recorded_events.append(evt)
+        self._rec_tree_insert(evt)
+        self._log(f"Inserted wait: {secs}s")
+
+    def _rec_insert_type(self):
+        dlg = ctk.CTkInputDialog(
+            text="Text to type:", title="Insert Type Text")
+        val = dlg.get_input()
+        if not val:
+            return
+        t = round(self._rec_last_time() + 0.01, 3)
+        evt = {"t": t, "type": "type_text", "text": val, "interval": 0.02}
+        self.recorded_events.append(evt)
+        self._rec_tree_insert(evt)
+        self._log(f"Inserted type text: {val[:30]}")
+
+    def _rec_insert_image(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp")])
+        if not path:
+            return
+        t = round(self._rec_last_time() + 0.01, 3)
+        evt = {"t": t, "type": "image_click", "image": path,
+               "confidence": 0.8, "timeout": 10}
+        self.recorded_events.append(evt)
+        self._rec_tree_insert(evt)
+        self._log(f"Inserted image click: {os.path.basename(path)}")
+
+    def _rec_delete_selected(self):
+        sel = self.rec_tree.selection()
+        if not sel:
+            return
+        items = list(self.rec_tree.get_children())
+        indices = sorted([items.index(s) for s in sel], reverse=True)
+        for idx in indices:
+            self.recorded_events.pop(idx)
+        self._rec_refresh_tree()
+        self._log(f"Deleted {len(indices)} event(s).")
+
+    def _rec_refresh_tree(self):
+        for item in self.rec_tree.get_children():
+            self.rec_tree.delete(item)
+        for evt in self.recorded_events:
+            self._rec_tree_insert(evt)
 
     # ============================================================
     #  Tab 4: Image Click
