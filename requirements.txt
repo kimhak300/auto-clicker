@@ -7,3 +7,4 @@ opencv-python
 screeninfo
 selenium
 webdriver-manager
+anthropic

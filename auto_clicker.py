@@ -29,11 +29,22 @@ import random
 import datetime
 import keyboard as kb_hotkey
 
+import base64
+import io
+import textwrap
+import re as _re_module
+
 try:
     from screeninfo import get_monitors
     HAS_SCREENINFO = True
 except ImportError:
     HAS_SCREENINFO = False
+
+try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
 
 try:
     from selenium import webdriver
@@ -214,6 +225,11 @@ class AutoClickerPro(ctk.CTk):
         self.web_form_fields = []
         self.web_error_policy = "stop"
         self._web_retry_count = 0
+        self.agent_running = False
+        self.agent_thread = None
+        self.agent_messages = []
+        self.agent_paused = False
+        self._api_code_running = False
         self.macro_steps = []
         self.scheduled_tasks = []
         self._scheduler_active = True
@@ -488,17 +504,29 @@ class AutoClickerPro(ctk.CTk):
         pynput_mouse.Listener(on_click=on_click).start()
 
     # ============================================================
-    #  Tab 3: Record & Replay (Mouse + Keyboard)
+    #  Tab 3: Record & Replay (with sub-tabs)
     # ============================================================
     def _build_record_tab(self):
         tab = self.tabview.add("Record & Replay")
 
+        self._rec_subtabs = ctk.CTkTabview(tab, anchor="nw")
+        self._rec_subtabs.pack(fill="both", expand=True, padx=4, pady=2)
+
+        self._build_desktop_recorder_subtab()
+        self._build_agent_mode_subtab()
+        self._build_api_automation_subtab()
+
+    # ---- Desktop Recorder sub-tab ----
+
+    def _build_desktop_recorder_subtab(self):
+        stab = self._rec_subtabs.add("Record & Replay")
+
         ctk.CTkLabel(
-            tab, text="Record mouse clicks + keyboard, then replay",
+            stab, text="Record mouse clicks + keyboard, then replay",
             font=("Segoe UI", 14, "bold")
         ).pack(anchor="w", padx=12, pady=(8, 4))
 
-        btn = ctk.CTkFrame(tab)
+        btn = ctk.CTkFrame(stab)
         btn.pack(fill="x", padx=12, pady=4)
         self.rec_btn = ctk.CTkButton(
             btn, text=f"Start Recording ({HOTKEY_RECORD})",
@@ -514,7 +542,7 @@ class AutoClickerPro(ctk.CTk):
             hover_color="#dc2626", width=120, command=self._stop
         ).pack(side="left", padx=4)
 
-        rec_opt = ctk.CTkFrame(tab)
+        rec_opt = ctk.CTkFrame(stab)
         rec_opt.pack(fill="x", padx=12, pady=4)
         self.rec_click_var = ctk.BooleanVar(value=True)
         self.rec_move_var = ctk.BooleanVar(value=False)
@@ -530,7 +558,7 @@ class AutoClickerPro(ctk.CTk):
                         variable=self.rec_kb_var).pack(side="left", padx=6)
 
         # Manual insert buttons
-        insert_f = ctk.CTkFrame(tab)
+        insert_f = ctk.CTkFrame(stab)
         insert_f.pack(fill="x", padx=12, pady=2)
         ctk.CTkLabel(insert_f, text="Insert:", text_color="gray60").pack(
             side="left", padx=4)
@@ -551,7 +579,7 @@ class AutoClickerPro(ctk.CTk):
                       command=self._rec_delete_selected
                       ).pack(side="right", padx=3)
 
-        list_frame = ctk.CTkFrame(tab)
+        list_frame = ctk.CTkFrame(stab)
         list_frame.pack(fill="both", expand=True, padx=12, pady=4)
 
         cols = ("time", "type", "detail")
@@ -568,7 +596,7 @@ class AutoClickerPro(ctk.CTk):
         sb.pack(side="right", fill="y")
         self.rec_tree.configure(yscrollcommand=sb.set)
 
-        ctrl = ctk.CTkFrame(tab)
+        ctrl = ctk.CTkFrame(stab)
         ctrl.pack(fill="x", padx=12, pady=4)
         ctk.CTkLabel(ctrl, text="Loops:").pack(side="left", padx=4)
         self.replay_loops_var = ctk.StringVar(value="1")
@@ -587,12 +615,733 @@ class AutoClickerPro(ctk.CTk):
             ctrl, values=["sec", "min", "hr"], width=60)
         self.replay_delay_unit.set("sec")
         self.replay_delay_unit.pack(side="left", padx=2)
+        ctk.CTkButton(ctrl, text="Export Script", width=90,
+                      fg_color="#8b5cf6", hover_color="#7c3aed",
+                      command=self._rec_export_script).pack(side="right", padx=4)
         ctk.CTkButton(ctrl, text="Save", width=70,
                       command=self._save_recording).pack(side="right", padx=4)
         ctk.CTkButton(ctrl, text="Load", width=70,
                       command=self._load_recording).pack(side="right", padx=4)
         ctk.CTkButton(ctrl, text="Clear", width=70, fg_color="gray30",
                       command=self._clear_recording).pack(side="right", padx=4)
+
+    # ---- Agent Mode sub-tab ----
+
+    def _build_agent_mode_subtab(self):
+        stab = self._rec_subtabs.add("Agent Mode")
+
+        if not HAS_ANTHROPIC:
+            ctk.CTkLabel(
+                stab, text="anthropic package not installed!",
+                font=("Segoe UI", 16, "bold"), text_color="#ef4444"
+            ).pack(pady=30)
+            ctk.CTkLabel(
+                stab, text="pip install anthropic\n\nThen restart.",
+                font=("Consolas", 12)
+            ).pack()
+            return
+
+        # -- API Key row --
+        key_f = ctk.CTkFrame(stab)
+        key_f.pack(fill="x", padx=12, pady=(8, 4))
+        ctk.CTkLabel(key_f, text="API Key:").pack(side="left", padx=4)
+        self.agent_key_var = ctk.StringVar()
+        self.agent_key_entry = ctk.CTkEntry(
+            key_f, textvariable=self.agent_key_var, width=320, show="*")
+        self.agent_key_entry.pack(side="left", padx=4)
+        ctk.CTkButton(key_f, text="Save Key", width=80,
+                      fg_color="gray30", command=self._agent_save_key
+                      ).pack(side="left", padx=4)
+        self._agent_show_key_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(key_f, text="Show", width=60,
+                        variable=self._agent_show_key_var,
+                        command=self._agent_toggle_key_show
+                        ).pack(side="left", padx=4)
+
+        # -- Model / max steps row --
+        model_f = ctk.CTkFrame(stab)
+        model_f.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(model_f, text="Model:").pack(side="left", padx=4)
+        self.agent_model_var = ctk.StringVar(value="claude-sonnet-4-20250514")
+        ctk.CTkOptionMenu(
+            model_f, variable=self.agent_model_var,
+            values=["claude-sonnet-4-20250514",
+                    "claude-opus-4-20250514",
+                    "claude-haiku-35-20241022"],
+            width=240
+        ).pack(side="left", padx=4)
+        ctk.CTkLabel(model_f, text="Max Steps:").pack(side="left", padx=(12, 4))
+        self.agent_max_steps_var = ctk.StringVar(value="30")
+        ctk.CTkEntry(model_f, textvariable=self.agent_max_steps_var,
+                     width=50).pack(side="left", padx=4)
+
+        # -- Goal text --
+        goal_f = ctk.CTkFrame(stab)
+        goal_f.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(goal_f, text="Goal / Task:").pack(anchor="w", padx=4)
+        self.agent_goal_text = ctk.CTkTextbox(
+            goal_f, height=50, font=("Consolas", 11))
+        self.agent_goal_text.pack(fill="x", padx=4, pady=2)
+
+        # -- Control buttons --
+        ctrl_f = ctk.CTkFrame(stab)
+        ctrl_f.pack(fill="x", padx=12, pady=4)
+        self.agent_start_btn = ctk.CTkButton(
+            ctrl_f, text="Start Agent", fg_color="#22c55e",
+            hover_color="#16a34a", width=120,
+            command=self._web_agent_start)
+        self.agent_start_btn.pack(side="left", padx=4)
+        self.agent_pause_btn = ctk.CTkButton(
+            ctrl_f, text="Pause", fg_color="#f59e0b",
+            hover_color="#d97706", width=80,
+            command=self._web_agent_pause, state="disabled")
+        self.agent_pause_btn.pack(side="left", padx=4)
+        self.agent_stop_btn = ctk.CTkButton(
+            ctrl_f, text="Stop", fg_color="#ef4444",
+            hover_color="#dc2626", width=80,
+            command=self._web_agent_stop, state="disabled")
+        self.agent_stop_btn.pack(side="left", padx=4)
+        ctk.CTkButton(
+            ctrl_f, text="Clear Log", fg_color="gray30", width=80,
+            command=self._agent_clear_log
+        ).pack(side="left", padx=4)
+
+        # -- Agent log --
+        ctk.CTkLabel(stab, text="Agent Reasoning Log",
+                     font=("Segoe UI", 11, "bold"),
+                     text_color="gray60").pack(anchor="w", padx=12, pady=(4, 0))
+        self.agent_log_box = ctk.CTkTextbox(
+            stab, font=("Consolas", 10), fg_color="gray12",
+            text_color="gray70", state="disabled")
+        self.agent_log_box.pack(fill="both", expand=True, padx=12, pady=(2, 8))
+
+        # Load saved key on startup
+        self._agent_load_key()
+
+    # ---- Agent Mode methods ----
+
+    def _agent_toggle_key_show(self):
+        if self._agent_show_key_var.get():
+            self.agent_key_entry.configure(show="")
+        else:
+            self.agent_key_entry.configure(show="*")
+
+    def _agent_save_key(self):
+        key = self.agent_key_var.get().strip()
+        if not key:
+            self._log("No API key to save.")
+            return
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        lines = []
+        found = False
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("ANTHROPIC_API_KEY="):
+                        lines.append(f"ANTHROPIC_API_KEY={key}\n")
+                        found = True
+                    else:
+                        lines.append(line)
+        if not found:
+            lines.append(f"ANTHROPIC_API_KEY={key}\n")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        self._log("API key saved to .env")
+
+    def _agent_load_key(self):
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        if not os.path.exists(env_path):
+            return
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("ANTHROPIC_API_KEY="):
+                        key = line.split("=", 1)[1].strip()
+                        if key:
+                            self.agent_key_var.set(key)
+                            return
+        except Exception:
+            pass
+
+    def _agent_log(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        def _update():
+            self.agent_log_box.configure(state="normal")
+            self.agent_log_box.insert("end", f"[{ts}] {msg}\n")
+            self.agent_log_box.see("end")
+            self.agent_log_box.configure(state="disabled")
+        self.after(0, _update)
+
+    def _agent_clear_log(self):
+        self.agent_log_box.configure(state="normal")
+        self.agent_log_box.delete("0.0", "end")
+        self.agent_log_box.configure(state="disabled")
+
+    def _agent_update_buttons(self):
+        if self.agent_running:
+            self.agent_start_btn.configure(state="disabled")
+            self.agent_pause_btn.configure(state="normal")
+            self.agent_stop_btn.configure(state="normal")
+        else:
+            self.agent_start_btn.configure(state="normal")
+            self.agent_pause_btn.configure(state="disabled", text="Pause")
+            self.agent_stop_btn.configure(state="disabled")
+            self.agent_paused = False
+
+    def _web_agent_start(self):
+        goal = self.agent_goal_text.get("0.0", "end").strip()
+        if not goal:
+            messagebox.showwarning("No Goal", "Enter a goal/task for the agent.")
+            return
+        api_key = self.agent_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("No API Key",
+                                   "Enter your Anthropic API key.")
+            return
+        if not self.web_driver:
+            messagebox.showwarning("No Browser",
+                                   "Launch a browser from the Web Automation tab first.")
+            return
+        if self.agent_running:
+            return
+        model = self.agent_model_var.get()
+        max_steps = int(self.agent_max_steps_var.get() or 30)
+
+        self.agent_running = True
+        self.agent_paused = False
+        self._agent_update_buttons()
+        self.agent_thread = threading.Thread(
+            target=self._web_agent_loop,
+            args=(goal, api_key, model, max_steps),
+            daemon=True)
+        self.agent_thread.start()
+
+    def _web_agent_stop(self):
+        self.agent_running = False
+        self.agent_paused = False
+        self._agent_log("Stop requested...")
+
+    def _web_agent_pause(self):
+        if self.agent_paused:
+            self.agent_paused = False
+            self.agent_pause_btn.configure(text="Pause")
+            self._agent_log("Resumed.")
+        else:
+            self.agent_paused = True
+            self.agent_pause_btn.configure(text="Resume")
+            self._agent_log("Paused. Click Resume to continue.")
+
+    def _agent_take_screenshot(self):
+        try:
+            png_bytes = self.web_driver.get_screenshot_as_png()
+            return base64.b64encode(png_bytes).decode('utf-8')
+        except Exception as e:
+            self._agent_log(f"Screenshot error: {e}")
+            return None
+
+    def _agent_execute_action(self, action):
+        action_type = action.get("action", "")
+        if action_type == "click":
+            selector = action.get("selector", "")
+            if selector:
+                self._web_exec_line(f"click css={selector}")
+        elif action_type == "type":
+            selector = action.get("selector", "")
+            text = action.get("text", "")
+            if selector:
+                self._web_exec_line(f"type css={selector} {text}")
+        elif action_type == "scroll":
+            direction = action.get("direction", "down")
+            pixels = action.get("pixels", 300)
+            px = pixels if direction == "down" else -pixels
+            self.web_driver.execute_script(f"window.scrollBy(0,{px})")
+        elif action_type == "navigate":
+            url = action.get("url", "")
+            if url:
+                self.web_driver.get(url)
+        elif action_type == "select":
+            selector = action.get("selector", "")
+            value = action.get("value", "")
+            if selector and HAS_SELENIUM:
+                from selenium.webdriver.support.ui import Select
+                el = self._web_find(f"css={selector}")
+                Select(el).select_by_visible_text(value)
+        elif action_type == "wait":
+            secs = float(action.get("seconds", 2))
+            time.sleep(secs)
+        elif action_type == "screenshot":
+            pass  # Just observe, no action needed
+        elif action_type == "back":
+            self.web_driver.back()
+        elif action_type == "done":
+            pass  # Handled in the loop
+        elif action_type == "ask_user":
+            pass  # Handled in the loop
+        else:
+            self._agent_log(f"Unknown action type: {action_type}")
+
+    def _web_agent_loop(self, goal, api_key, model, max_steps):
+        client = anthropic.Anthropic(api_key=api_key)
+
+        system_prompt = textwrap.dedent("""\
+            You are a browser automation agent. You can see screenshots of a web browser and take actions to accomplish the user's goal.
+
+            Available actions (respond with exactly ONE action per turn as a JSON object):
+            - {"action": "click", "selector": "css selector"}
+            - {"action": "type", "selector": "css selector", "text": "text to type"}
+            - {"action": "scroll", "direction": "down", "pixels": 300}
+            - {"action": "navigate", "url": "https://..."}
+            - {"action": "select", "selector": "css selector", "value": "option text"}
+            - {"action": "wait", "seconds": 2}
+            - {"action": "screenshot"} (just observe, no action)
+            - {"action": "back"}
+            - {"action": "done", "summary": "what was accomplished"}
+            - {"action": "ask_user", "question": "what to ask"}
+
+            Always respond with a JSON object containing "thinking" (your reasoning) and "action" (the action to take).
+            Example: {"thinking": "I need to click the search button", "action": {"action": "click", "selector": "#search-btn"}}
+
+            Be careful with sensitive actions like purchases or form submissions - use ask_user to confirm first.""")
+
+        messages = []
+
+        for step in range(max_steps):
+            if not self.agent_running:
+                break
+
+            # Handle pause
+            while self.agent_paused and self.agent_running:
+                time.sleep(0.2)
+            if not self.agent_running:
+                break
+
+            # Take screenshot
+            screenshot_b64 = self._agent_take_screenshot()
+            if screenshot_b64 is None:
+                self._agent_log("Failed to take screenshot. Stopping.")
+                break
+
+            # Build message with screenshot
+            content = [
+                {"type": "text", "text": f"Step {step+1}/{max_steps}. Goal: {goal}\nCurrent browser state:"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}}
+            ]
+
+            if step == 0:
+                messages = [{"role": "user", "content": content}]
+            else:
+                messages.append({"role": "user", "content": content})
+
+            # Call Claude API
+            try:
+                self._agent_log(f"Step {step+1}: Sending screenshot to Claude...")
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=1024,
+                    system=system_prompt,
+                    messages=messages
+                )
+                reply_text = response.content[0].text
+                messages.append({"role": "assistant", "content": reply_text})
+            except Exception as e:
+                self._agent_log(f"API Error: {e}")
+                break
+
+            # Parse response
+            try:
+                json_match = _re_module.search(r'\{.*\}', reply_text, _re_module.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group())
+                else:
+                    self._agent_log(f"Could not parse response: {reply_text[:200]}")
+                    continue
+            except json.JSONDecodeError:
+                self._agent_log(f"Invalid JSON: {reply_text[:200]}")
+                continue
+
+            thinking = data.get("thinking", "")
+            action = data.get("action", {})
+            action_type = action.get("action", "")
+
+            self._agent_log(f"Step {step+1}: {thinking}")
+            action_detail = {k: v for k, v in action.items() if k != "action"}
+            self._agent_log(f"  Action: {action_type} {json.dumps(action_detail)}")
+
+            # Execute action
+            try:
+                if action_type == "done":
+                    self._agent_log(f"DONE: {action.get('summary', 'Task completed')}")
+                    break
+                elif action_type == "ask_user":
+                    answer = [None]
+                    event = threading.Event()
+                    def ask(q=action.get("question", "Proceed?")):
+                        answer[0] = messagebox.askyesno("Agent Question", q)
+                        event.set()
+                    self.after(0, ask)
+                    event.wait(timeout=120)
+                    if answer[0] is None:
+                        answer[0] = False
+                    user_resp = "Yes" if answer[0] else "No"
+                    self._agent_log(f"  User responded: {user_resp}")
+                    messages.append({"role": "user", "content": f"User responded: {user_resp}"})
+                else:
+                    self._agent_execute_action(action)
+            except Exception as e:
+                self._agent_log(f"  Error executing action: {e}")
+                messages.append({"role": "user", "content": f"Action failed with error: {e}"})
+
+            time.sleep(1)  # Small delay between steps
+
+        self.agent_running = False
+        self._agent_log("Agent stopped.")
+        self.after(0, self._agent_update_buttons)
+
+    # ---- API Automation sub-tab ----
+
+    _API_TEMPLATES = {
+        "login": '''# Login Flow
+driver.get("https://example.com/login")
+time.sleep(1)
+
+# Fill credentials
+username = driver.find_element(By.ID, "username")
+username.clear()
+username.send_keys("your_username")
+
+password = driver.find_element(By.ID, "password")
+password.clear()
+password.send_keys("your_password")
+
+# Submit
+driver.find_element(By.CSS_SELECTOR, "button[type=submit]").click()
+log("Login submitted")
+time.sleep(2)
+screenshot("after_login.png")
+''',
+        "scraping": '''# Web Scraping
+import csv
+
+driver.get("https://example.com/products")
+time.sleep(2)
+
+items = driver.find_elements(By.CSS_SELECTOR, ".product-item")
+data = []
+for item in items:
+    name = item.find_element(By.CSS_SELECTOR, ".name").text
+    price = item.find_element(By.CSS_SELECTOR, ".price").text
+    data.append({"name": name, "price": price})
+    log(f"Found: {name} - {price}")
+
+# Save to CSV
+with open("products.csv", "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["name", "price"])
+    writer.writeheader()
+    writer.writerows(data)
+log(f"Saved {len(data)} products to products.csv")
+''',
+        "booking": '''# Booking Flow (with confirmations)
+driver.get("https://example.com/booking")
+time.sleep(2)
+
+# Fill booking details
+driver.find_element(By.ID, "checkin").send_keys("2025-03-15")
+driver.find_element(By.ID, "checkout").send_keys("2025-03-20")
+driver.find_element(By.ID, "guests").send_keys("2")
+driver.find_element(By.CSS_SELECTOR, "button.search").click()
+time.sleep(3)
+
+# Get options
+options = driver.find_elements(By.CSS_SELECTOR, ".room-option")
+for i, opt in enumerate(options):
+    name = opt.find_element(By.CSS_SELECTOR, ".room-name").text
+    price = opt.find_element(By.CSS_SELECTOR, ".room-price").text
+    log(f"Option {i+1}: {name} - {price}")
+
+# Confirm before booking
+if confirm("Proceed with booking the first option?"):
+    options[0].find_element(By.CSS_SELECTOR, ".book-btn").click()
+    log("Booking initiated!")
+else:
+    log("Booking cancelled by user")
+''',
+        "form_fill": '''# Form Fill Automation
+driver.get("https://example.com/form")
+time.sleep(1)
+
+fields = {
+    "name": "John Doe",
+    "email": "john@example.com",
+    "phone": "1234567890",
+    "address": "123 Main St",
+}
+
+for field_id, value in fields.items():
+    try:
+        el = driver.find_element(By.ID, field_id)
+        el.clear()
+        el.send_keys(value)
+        log(f"Filled {field_id}: {value}")
+    except Exception as e:
+        log(f"Field {field_id} not found: {e}")
+
+if confirm("Submit the form?"):
+    driver.find_element(By.CSS_SELECTOR, "button[type=submit]").click()
+    log("Form submitted!")
+    time.sleep(2)
+    screenshot("form_result.png")
+''',
+    }
+
+    def _build_api_automation_subtab(self):
+        stab = self._rec_subtabs.add("API Automation")
+
+        if not HAS_SELENIUM:
+            ctk.CTkLabel(
+                stab, text="Selenium not installed!",
+                font=("Segoe UI", 16, "bold"), text_color="#ef4444"
+            ).pack(pady=30)
+            ctk.CTkLabel(
+                stab, text="pip install selenium webdriver-manager\n\nThen restart.",
+                font=("Consolas", 12)
+            ).pack()
+            return
+
+        # -- Template buttons --
+        tpl_f = ctk.CTkFrame(stab)
+        tpl_f.pack(fill="x", padx=12, pady=(8, 4))
+        ctk.CTkLabel(tpl_f, text="Templates:",
+                     font=("Segoe UI", 11, "bold")).pack(side="left", padx=4)
+        for label, tpl_name in [
+            ("Login Flow", "login"),
+            ("Form Fill", "form_fill"),
+            ("Scraping", "scraping"),
+            ("Booking Flow", "booking"),
+            ("Custom", "custom"),
+        ]:
+            ctk.CTkButton(
+                tpl_f, text=label, width=90, height=26,
+                font=("Segoe UI", 11),
+                fg_color="#6366f1", hover_color="#4f46e5",
+                command=lambda t=tpl_name: self._api_load_template(t)
+            ).pack(side="left", padx=3)
+
+        # -- Code editor --
+        self.api_code_editor = ctk.CTkTextbox(
+            stab, font=("Consolas", 11))
+        self.api_code_editor.pack(fill="both", expand=True, padx=12, pady=4)
+        self.api_code_editor.insert("0.0", textwrap.dedent("""\
+            # Python Code - API Automation
+            # Available variables:
+            #   driver  - Selenium WebDriver (from Web Automation tab)
+            #   By, Keys, WebDriverWait, EC, ActionChains - Selenium imports
+            #   time, json, os - Standard library
+            #   log(msg)       - Print to output log below
+            #   confirm(msg)   - Show Yes/No dialog, returns True/False
+            #   screenshot(fn) - Save browser screenshot
+            #
+            # Select a template above or write your own code.
+
+            driver.get("https://example.com")
+            time.sleep(1)
+            log("Page loaded: " + driver.title)
+            screenshot("page.png")
+            """))
+
+        # -- Run controls --
+        run_f = ctk.CTkFrame(stab)
+        run_f.pack(fill="x", padx=12, pady=2)
+        self.api_run_btn = ctk.CTkButton(
+            run_f, text="Run Code", fg_color="#22c55e",
+            hover_color="#16a34a", width=100,
+            command=self._api_run_code)
+        self.api_run_btn.pack(side="left", padx=4)
+        self.api_stop_btn = ctk.CTkButton(
+            run_f, text="Stop", fg_color="#ef4444",
+            hover_color="#dc2626", width=80,
+            command=self._api_stop_code, state="disabled")
+        self.api_stop_btn.pack(side="left", padx=4)
+        ctk.CTkButton(
+            run_f, text="Clear Output", fg_color="gray30", width=100,
+            command=self._api_clear_output
+        ).pack(side="left", padx=4)
+
+        # -- Output log --
+        ctk.CTkLabel(stab, text="Output",
+                     font=("Segoe UI", 11, "bold"),
+                     text_color="gray60").pack(anchor="w", padx=12, pady=(4, 0))
+        self.api_output_box = ctk.CTkTextbox(
+            stab, height=100, font=("Consolas", 10),
+            fg_color="gray12", text_color="gray70", state="disabled")
+        self.api_output_box.pack(fill="x", padx=12, pady=(2, 8))
+
+    # ---- API Automation methods ----
+
+    def _api_load_template(self, name):
+        if name == "custom":
+            self.api_code_editor.delete("0.0", "end")
+            self.api_code_editor.insert("0.0", textwrap.dedent("""\
+                # Custom automation code
+                # driver, By, Keys, etc. are available
+                # Use log() to print, confirm() for dialogs
+
+                """))
+            self._log("Custom template loaded.")
+            return
+        tpl = self._API_TEMPLATES.get(name, "")
+        if tpl:
+            self.api_code_editor.delete("0.0", "end")
+            self.api_code_editor.insert("0.0", tpl)
+            self._log(f"API template '{name}' loaded.")
+
+    def _api_log(self, msg):
+        def _update():
+            self.api_output_box.configure(state="normal")
+            self.api_output_box.insert("end", str(msg) + "\n")
+            self.api_output_box.see("end")
+            self.api_output_box.configure(state="disabled")
+        self.after(0, _update)
+
+    def _api_clear_output(self):
+        self.api_output_box.configure(state="normal")
+        self.api_output_box.delete("0.0", "end")
+        self.api_output_box.configure(state="disabled")
+
+    def _api_run_code(self):
+        if not self.web_driver:
+            messagebox.showwarning("No Browser",
+                                   "Launch a browser from the Web Automation tab first.")
+            return
+        if self._api_code_running:
+            return
+
+        code = self.api_code_editor.get("0.0", "end").strip()
+        if not code:
+            return
+
+        self._api_code_running = True
+        self.api_run_btn.configure(state="disabled")
+        self.api_stop_btn.configure(state="normal")
+
+        def confirm_fn(msg="Continue?"):
+            result = [None]
+            event = threading.Event()
+            def ask():
+                result[0] = messagebox.askyesno("Confirm", msg)
+                event.set()
+            self.after(0, ask)
+            event.wait(timeout=120)
+            return bool(result[0])
+
+        def screenshot_fn(filename="screenshot.png"):
+            try:
+                self.web_driver.save_screenshot(filename)
+                self._api_log(f"Screenshot saved: {filename}")
+            except Exception as e:
+                self._api_log(f"Screenshot error: {e}")
+
+        def worker():
+            # Redirect stdout
+            old_stdout = io.StringIO()
+            namespace = {
+                "driver": self.web_driver,
+                "time": time,
+                "json": json,
+                "os": os,
+                "log": self._api_log,
+                "confirm": confirm_fn,
+                "screenshot": screenshot_fn,
+            }
+            if HAS_SELENIUM:
+                namespace.update({
+                    "By": By,
+                    "Keys": Keys,
+                    "WebDriverWait": WebDriverWait,
+                    "EC": EC,
+                    "ActionChains": ActionChains,
+                })
+            try:
+                # Capture print output
+                import sys
+                old_stdout = sys.stdout
+                sys.stdout = captured = io.StringIO()
+                try:
+                    exec(code, namespace)
+                finally:
+                    sys.stdout = old_stdout
+                # Send any print output to the log
+                printed = captured.getvalue()
+                if printed.strip():
+                    for line in printed.strip().splitlines():
+                        self._api_log(line)
+                self._api_log("--- Code execution finished ---")
+            except Exception as e:
+                self._api_log(f"ERROR: {e}")
+            finally:
+                self._api_code_running = False
+                def _reset():
+                    self.api_run_btn.configure(state="normal")
+                    self.api_stop_btn.configure(state="disabled")
+                self.after(0, _reset)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _api_stop_code(self):
+        self._api_code_running = False
+        self._api_log("Stop requested (note: running code may not stop immediately).")
+        self.api_run_btn.configure(state="normal")
+        self.api_stop_btn.configure(state="disabled")
+
+    # ---- Export recorded events as script ----
+
+    def _rec_export_script(self):
+        if not self.recorded_events:
+            messagebox.showinfo("Empty", "Nothing recorded to export.")
+            return
+        lines = [
+            "# Exported from Record & Replay",
+            "# Format: workflow script (compatible with Web Automation Workflow tab)",
+            ""
+        ]
+        for evt in self.recorded_events:
+            etype = evt["type"]
+            if etype in ("mouse_click", "mouse_down", "mouse_up"):
+                x, y = evt.get("x", 0), evt.get("y", 0)
+                lines.append(f"# {etype} at ({x}, {y}) btn={evt.get('button', 'left')}")
+            elif etype == "mouse_scroll":
+                dy = evt.get("dy", 0)
+                px = abs(dy) * 100
+                direction = "up" if dy > 0 else "down"
+                lines.append(f"scroll {'-' if direction == 'up' else ''}{px}")
+            elif etype == "key_press":
+                key = evt.get("key", "")
+                lines.append(f"# key_press {key}")
+            elif etype in ("key_down", "key_up"):
+                key = evt.get("key", "")
+                lines.append(f"# {etype} {key}")
+            elif etype == "type_text":
+                text = evt.get("text", "")
+                lines.append(f"# type_text: {text}")
+            elif etype == "wait":
+                secs = evt.get("seconds", 1)
+                lines.append(f"wait {secs}")
+            elif etype == "image_click":
+                img = evt.get("image", "")
+                lines.append(f"# image_click {img}")
+            elif etype == "mouse_move":
+                lines.append(f"# mouse_move ({evt.get('x',0)}, {evt.get('y',0)})")
+            else:
+                lines.append(f"# {etype} {json.dumps(evt)}")
+
+        script_text = "\n".join(lines) + "\n"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(script_text)
+            self._log(f"Exported {len(self.recorded_events)} events as script to {path}")
 
     def _toggle_record(self):
         if self.recording:
@@ -3291,6 +4040,8 @@ class AutoClickerPro(ctk.CTk):
     def _on_close(self):
         self.running = False
         self.recording = False
+        self.agent_running = False
+        self._api_code_running = False
         self._scheduler_active = False
         kb_hotkey.unhook_all()
         if self._mouse_listener:
