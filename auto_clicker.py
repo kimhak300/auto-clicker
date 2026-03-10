@@ -61,6 +61,8 @@ ctk.set_default_color_theme("blue")
 HOTKEY_START_STOP = "F6"
 HOTKEY_RECORD = "F7"
 HOTKEY_PICK = "F8"
+HOTKEY_REPLAY = "F9"
+HOTKEY_STOP = "F10"
 
 MACRO_ACTIONS = [
     "Mouse Click",
@@ -228,6 +230,8 @@ class AutoClickerPro(ctk.CTk):
         ctk.CTkLabel(
             top, text=f"  {HOTKEY_START_STOP} Start/Stop  |  "
                       f"{HOTKEY_RECORD} Record  |  "
+                      f"{HOTKEY_REPLAY} Replay  |  "
+                      f"{HOTKEY_STOP} Stop  |  "
                       f"{HOTKEY_PICK} Pick Coord",
             font=("Consolas", 11), text_color="gray60"
         ).pack(side="left", padx=8, pady=4)
@@ -497,12 +501,12 @@ class AutoClickerPro(ctk.CTk):
             width=200, command=self._toggle_record)
         self.rec_btn.pack(side="left", padx=4)
         ctk.CTkButton(
-            btn, text="Replay", fg_color="#22c55e",
-            hover_color="#16a34a", width=100, command=self._start_replay
+            btn, text=f"Replay ({HOTKEY_REPLAY})", fg_color="#22c55e",
+            hover_color="#16a34a", width=120, command=self._start_replay
         ).pack(side="left", padx=4)
         ctk.CTkButton(
-            btn, text="Stop", fg_color="#ef4444",
-            hover_color="#dc2626", width=100, command=self._stop
+            btn, text=f"Stop ({HOTKEY_STOP})", fg_color="#ef4444",
+            hover_color="#dc2626", width=120, command=self._stop
         ).pack(side="left", padx=4)
 
         rec_opt = ctk.CTkFrame(tab)
@@ -533,6 +537,9 @@ class AutoClickerPro(ctk.CTk):
                       ).pack(side="left", padx=3)
         ctk.CTkButton(insert_f, text="+ Image Click", width=100,
                       fg_color="gray30", command=self._rec_insert_image
+                      ).pack(side="left", padx=3)
+        ctk.CTkButton(insert_f, text="+ Scroll", width=80,
+                      fg_color="gray30", command=self._rec_insert_scroll
                       ).pack(side="left", padx=3)
         ctk.CTkButton(insert_f, text="Delete Selected", width=110,
                       fg_color="#7f1d1d", hover_color="#991b1b",
@@ -567,6 +574,14 @@ class AutoClickerPro(ctk.CTk):
             ctrl, values=["0.25x", "0.5x", "1x", "2x", "4x", "8x"], width=70)
         self.replay_speed.set("1x")
         self.replay_speed.pack(side="left", padx=4)
+        ctk.CTkLabel(ctrl, text="Delay:").pack(side="left", padx=(12, 4))
+        self.replay_delay_var = ctk.StringVar(value="0")
+        ctk.CTkEntry(ctrl, textvariable=self.replay_delay_var, width=50).pack(
+            side="left", padx=2)
+        self.replay_delay_unit = ctk.CTkOptionMenu(
+            ctrl, values=["sec", "min", "hr"], width=60)
+        self.replay_delay_unit.set("sec")
+        self.replay_delay_unit.pack(side="left", padx=2)
         ctk.CTkButton(ctrl, text="Save", width=70,
                       command=self._save_recording).pack(side="right", padx=4)
         ctk.CTkButton(ctrl, text="Load", width=70,
@@ -589,27 +604,42 @@ class AutoClickerPro(ctk.CTk):
         self._log("Recording... Press " + HOTKEY_RECORD + " to stop.")
 
         hotkeys = {HOTKEY_START_STOP.lower(), HOTKEY_RECORD.lower(),
-                   HOTKEY_PICK.lower()}
+                   HOTKEY_PICK.lower(), HOTKEY_REPLAY.lower(),
+                   HOTKEY_STOP.lower()}
         rec_clicks = self.rec_click_var.get()
         rec_moves = self.rec_move_var.get()
         rec_scroll = self.rec_scroll_var.get()
 
         # Mouse listeners
         if rec_clicks or rec_moves or rec_scroll:
+            self._held_buttons = {}
+
             def on_click(x, y, button, pressed):
                 if not self.recording:
                     return False
                 if not rec_clicks:
                     return
+                t = round(time.time() - self._record_start, 3)
+                btn = button.name if hasattr(button, 'name') else str(button)
                 if pressed:
-                    t = round(time.time() - self._record_start, 3)
-                    btn = button.name if hasattr(button, 'name') else str(button)
-                    evt = {"t": t, "type": "mouse_click",
+                    self._held_buttons[btn] = t
+                    evt = {"t": t, "type": "mouse_down",
                            "x": x, "y": y, "button": btn}
                     self.recorded_events.append(evt)
                     self.rec_tree.insert(
                         "", "end",
-                        values=(f"{t}s", "Click", f"({x},{y}) {btn}"))
+                        values=(f"{t}s", "Down", f"({x},{y}) {btn}"))
+                else:
+                    down_t = self._held_buttons.pop(btn, t)
+                    hold = round(t - down_t, 3)
+                    evt = {"t": t, "type": "mouse_up",
+                           "x": x, "y": y, "button": btn,
+                           "hold": hold}
+                    self.recorded_events.append(evt)
+                    self.rec_tree.insert(
+                        "", "end",
+                        values=(f"{t}s", "Up",
+                                f"({x},{y}) {btn} held {hold}s"))
 
             def on_move(x, y):
                 if not self.recording or not rec_moves:
@@ -644,22 +674,75 @@ class AutoClickerPro(ctk.CTk):
             self._mouse_listener.start()
 
         if self.rec_kb_var.get():
-            def on_key(key):
+            self._held_keys = {}  # vk/name -> key_str
+
+            def _pynput_key_str(key):
+                """Convert pynput key to a stable string name."""
+                # Special keys (ctrl, shift, alt, enter, etc.)
+                if isinstance(key, pynput_kb.Key):
+                    return key.name  # e.g. 'ctrl_l', 'shift', 'space'
+                # Regular keys - prefer vk code (reliable even
+                # when modifiers change the char)
+                vk = getattr(key, 'vk', None)
+                if vk is not None:
+                    if 65 <= vk <= 90:   # A-Z
+                        return chr(vk).lower()
+                    if 48 <= vk <= 57:   # 0-9
+                        return chr(vk)
+                    if 112 <= vk <= 123: # F1-F12
+                        return f"f{vk - 111}"
+                # Fallback to char if printable
+                try:
+                    if key.char is not None and key.char.isprintable():
+                        return key.char
+                except AttributeError:
+                    pass
+                # Last resort
+                if vk is not None:
+                    return f"vk_{vk}"
+                return str(key).replace("'", "")
+
+            def _key_id(key):
+                """Unique ID for dedup (vk code or name)."""
+                if isinstance(key, pynput_kb.Key):
+                    return key.name
+                vk = getattr(key, 'vk', None)
+                return vk if vk is not None else str(key)
+
+            def on_key_press(key):
                 if not self.recording:
                     return False
                 t = round(time.time() - self._record_start, 3)
-                try:
-                    key_str = key.char if key.char else str(key)
-                except AttributeError:
-                    key_str = str(key).replace("Key.", "")
+                key_str = _pynput_key_str(key)
+                kid = _key_id(key)
                 if key_str.lower() in hotkeys:
                     return
-                evt = {"t": t, "type": "key_press", "key": key_str}
+                if kid in self._held_keys:
+                    return
+                self._held_keys[kid] = key_str
+                evt = {"t": t, "type": "key_down", "key": key_str}
                 self.recorded_events.append(evt)
                 self.rec_tree.insert(
-                    "", "end", values=(f"{t}s", "Key", key_str))
+                    "", "end", values=(f"{t}s", "KeyDown", key_str))
 
-            self._kb_listener = pynput_kb.Listener(on_press=on_key)
+            def on_key_release(key):
+                if not self.recording:
+                    return False
+                t = round(time.time() - self._record_start, 3)
+                kid = _key_id(key)
+                # Use the same key_str from press for consistency
+                key_str = self._held_keys.pop(kid, None)
+                if key_str is None:
+                    key_str = _pynput_key_str(key)
+                if key_str.lower() in hotkeys:
+                    return
+                evt = {"t": t, "type": "key_up", "key": key_str}
+                self.recorded_events.append(evt)
+                self.rec_tree.insert(
+                    "", "end", values=(f"{t}s", "KeyUp", key_str))
+
+            self._kb_listener = pynput_kb.Listener(
+                on_press=on_key_press, on_release=on_key_release)
             self._kb_listener.start()
 
     def _stop_recording(self):
@@ -682,12 +765,25 @@ class AutoClickerPro(ctk.CTk):
             return
         loops = int(self.replay_loops_var.get() or 1)
         speed = float(self.replay_speed.get().replace("x", ""))
+        delay_val = float(self.replay_delay_var.get() or 0)
+        delay_unit = self.replay_delay_unit.get()
+        if delay_unit == "min":
+            delay_val *= 60
+        elif delay_unit == "hr":
+            delay_val *= 3600
+        loop_delay = max(0, delay_val)
 
         def worker():
             self._log(
                 f"Replaying {len(self.recorded_events)} events "
-                f"x {loops} at {speed}x")
-            for _ in range(loops):
+                f"x {loops} at {speed}x"
+                + (f" (delay {delay_val}s between loops)" if loop_delay > 0 else ""))
+            for loop_i in range(loops):
+                if loop_i > 0 and loop_delay > 0:
+                    self._log(f"Waiting {loop_delay}s before next loop...")
+                    end_t = time.time() + loop_delay
+                    while time.time() < end_t and self.running:
+                        time.sleep(0.1)
                 prev_t = 0
                 for evt in self.recorded_events:
                     if not self.running:
@@ -702,12 +798,30 @@ class AutoClickerPro(ctk.CTk):
                         pyautogui.click(
                             evt["x"], evt["y"],
                             button=evt.get("button", "left"))
+                    elif etype == "mouse_down":
+                        pyautogui.moveTo(evt["x"], evt["y"])
+                        pyautogui.mouseDown(
+                            button=evt.get("button", "left"))
+                    elif etype == "mouse_up":
+                        pyautogui.moveTo(evt["x"], evt["y"])
+                        pyautogui.mouseUp(
+                            button=evt.get("button", "left"))
                     elif etype == "mouse_move":
                         pyautogui.moveTo(evt["x"], evt["y"])
                     elif etype == "mouse_scroll":
                         clicks = evt.get("dy", 0)
                         pyautogui.scroll(
                             clicks, x=evt.get("x"), y=evt.get("y"))
+                    elif etype == "key_down":
+                        try:
+                            pyautogui.keyDown(self._map_key(evt["key"]))
+                        except Exception:
+                            pass
+                    elif etype == "key_up":
+                        try:
+                            pyautogui.keyUp(self._map_key(evt["key"]))
+                        except Exception:
+                            pass
                     elif etype == "key_press":
                         try:
                             pyautogui.press(evt["key"])
@@ -776,11 +890,20 @@ class AutoClickerPro(ctk.CTk):
         etype = evt["type"]
         if etype == "mouse_click":
             return "Click", f"({evt['x']},{evt['y']}) {evt.get('button','left')}"
+        elif etype == "mouse_down":
+            return "Down", f"({evt['x']},{evt['y']}) {evt.get('button','left')}"
+        elif etype == "mouse_up":
+            hold = evt.get("hold", 0)
+            return "Up", f"({evt['x']},{evt['y']}) {evt.get('button','left')} held {hold}s"
         elif etype == "mouse_move":
             return "Move", f"({evt['x']},{evt['y']})"
         elif etype == "mouse_scroll":
             d = "up" if evt.get("dy", 0) > 0 else "down"
             return "Scroll", f"({evt['x']},{evt['y']}) {d} {abs(evt.get('dy',0))}"
+        elif etype == "key_down":
+            return "KeyDown", evt.get("key", "")
+        elif etype == "key_up":
+            return "KeyUp", evt.get("key", "")
         elif etype == "key_press":
             return "Key", evt.get("key", "")
         elif etype == "type_text":
@@ -842,6 +965,40 @@ class AutoClickerPro(ctk.CTk):
         self.recorded_events.append(evt)
         self._rec_tree_insert(evt)
         self._log(f"Inserted image click: {os.path.basename(path)}")
+
+    def _rec_insert_scroll(self):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Insert Scroll")
+        dlg.geometry("300x200")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ctk.CTkLabel(dlg, text="Direction:").pack(anchor="w", padx=12, pady=(10, 2))
+        dir_var = ctk.StringVar(value="Down")
+        ctk.CTkOptionMenu(dlg, variable=dir_var,
+                          values=["Up", "Down"], width=120).pack(padx=12, anchor="w")
+
+        ctk.CTkLabel(dlg, text="Scroll amount (clicks):").pack(anchor="w", padx=12, pady=(8, 2))
+        amount_var = ctk.StringVar(value="3")
+        ctk.CTkEntry(dlg, textvariable=amount_var, width=120).pack(padx=12, anchor="w")
+
+        def confirm():
+            try:
+                amount = int(amount_var.get())
+            except ValueError:
+                return
+            dy = amount if dir_var.get() == "Up" else -amount
+            t = round(self._rec_last_time() + 0.01, 3)
+            x, y = pyautogui.position()
+            evt = {"t": t, "type": "mouse_scroll",
+                   "x": x, "y": y, "dx": 0, "dy": dy}
+            self.recorded_events.append(evt)
+            self._rec_tree_insert(evt)
+            direction = "up" if dy > 0 else "down"
+            self._log(f"Inserted scroll: {direction} {abs(dy)}")
+            dlg.destroy()
+
+        ctk.CTkButton(dlg, text="OK", width=100, command=confirm).pack(pady=12)
 
     def _rec_delete_selected(self):
         sel = self.rec_tree.selection()
@@ -1047,27 +1204,122 @@ class AutoClickerPro(ctk.CTk):
         ctk.CTkButton(launch_f, text="Navigate", width=90,
                       command=self._web_navigate).pack(side="left", padx=4)
 
-        ctk.CTkLabel(
-            tab,
-            text="Script: click | type | keys | wait | scroll "
-                 "| hover | select | screenshot | js",
-            text_color="gray60"
-        ).pack(anchor="w", padx=12, pady=(8, 2))
+        # -- Command Builder --
+        ctk.CTkLabel(tab, text="Command Builder",
+                     font=("Segoe UI", 12, "bold"),
+                     text_color="gray70").pack(anchor="w", padx=12, pady=(8, 2))
 
+        builder_f = ctk.CTkFrame(tab)
+        builder_f.pack(fill="x", padx=12, pady=4)
+
+        ctk.CTkLabel(builder_f, text="Action:").grid(
+            row=0, column=0, padx=4, pady=2, sticky="w")
+        self.web_action_var = ctk.StringVar(value="click")
+        self.web_action_menu = ctk.CTkOptionMenu(
+            builder_f,
+            values=["click", "type", "keys", "clear", "submit",
+                    "wait", "scroll", "hover", "select",
+                    "gettext", "assert", "iframe", "alert",
+                    "screenshot", "js", "navigate",
+                    "back", "forward", "refresh"],
+            variable=self.web_action_var, width=110,
+            command=self._web_builder_update)
+        self.web_action_menu.grid(row=0, column=1, padx=4, pady=2)
+
+        ctk.CTkLabel(builder_f, text="Locator:").grid(
+            row=0, column=2, padx=4, pady=2, sticky="w")
+        self.web_locator_type = ctk.CTkOptionMenu(
+            builder_f, values=["css=", "id=", "name=", "xpath=", "(none)"],
+            width=90)
+        self.web_locator_type.set("css=")
+        self.web_locator_type.grid(row=0, column=3, padx=4, pady=2)
+
+        self.web_selector_var = ctk.StringVar()
+        self.web_selector_entry = ctk.CTkEntry(
+            builder_f, textvariable=self.web_selector_var,
+            placeholder_text="#selector", width=150)
+        self.web_selector_entry.grid(row=0, column=4, padx=4, pady=2)
+
+        ctk.CTkLabel(builder_f, text="Value:").grid(
+            row=0, column=5, padx=4, pady=2, sticky="w")
+        self.web_value_var = ctk.StringVar()
+        self.web_value_entry = ctk.CTkEntry(
+            builder_f, textvariable=self.web_value_var,
+            placeholder_text="text / key / seconds", width=150)
+        self.web_value_entry.grid(row=0, column=6, padx=4, pady=2)
+
+        ctk.CTkButton(
+            builder_f, text="+ Add", width=70,
+            fg_color="#22c55e", hover_color="#16a34a",
+            command=self._web_add_cmd
+        ).grid(row=0, column=7, padx=4, pady=2)
+
+        self.web_pick_btn = ctk.CTkButton(
+            builder_f, text="Pick Element", width=100,
+            fg_color="#f59e0b", hover_color="#d97706",
+            command=self._web_pick_element)
+        self.web_pick_btn.grid(row=0, column=8, padx=4, pady=2)
+
+        # -- Templates --
+        tpl_f = ctk.CTkFrame(tab)
+        tpl_f.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(tpl_f, text="Templates:",
+                     font=("Segoe UI", 11, "bold")).pack(side="left", padx=4)
+        for label, tpl_name in [
+            ("Login", "login"),
+            ("Register", "register"),
+            ("Search", "search"),
+            ("Form Fill", "form_fill"),
+            ("Scrape Text", "scrape"),
+        ]:
+            ctk.CTkButton(
+                tpl_f, text=label, width=80, height=26,
+                font=("Segoe UI", 11),
+                fg_color="#6366f1", hover_color="#4f46e5",
+                command=lambda t=tpl_name: self._web_load_template(t)
+            ).pack(side="left", padx=2)
+
+        # -- Quick Insert Buttons --
+        quick_f = ctk.CTkFrame(tab)
+        quick_f.pack(fill="x", padx=12, pady=2)
+        for label, cmd_text in [
+            ("Click", "click css=#element"),
+            ("Type", "type id=input Hello"),
+            ("Enter", "keys id=input ENTER"),
+            ("Wait 1s", "wait 1.0"),
+            ("Scroll", "scroll 300"),
+            ("Screenshot", "screenshot capture.png"),
+            ("Back", "back"),
+            ("Refresh", "refresh"),
+        ]:
+            ctk.CTkButton(
+                quick_f, text=label, width=75, height=26,
+                font=("Segoe UI", 11),
+                command=lambda t=cmd_text: self._web_insert_line(t)
+            ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            quick_f, text="Clear All", width=75, height=26,
+            font=("Segoe UI", 11),
+            fg_color="#ef4444", hover_color="#dc2626",
+            command=lambda: self.web_script.delete("0.0", "end")
+        ).pack(side="left", padx=2)
+
+        # -- Script Editor --
         self.web_script = ctk.CTkTextbox(tab, font=("Consolas", 11))
         self.web_script.pack(fill="both", expand=True, padx=12, pady=4)
         self.web_script.insert("0.0",
-            "# click  css=#submit-btn         Click element\n"
-            "# type   id=search  Hello World   Type text\n"
-            "# keys   id=search  ENTER          Send key\n"
-            "# wait   2.0                       Pause seconds\n"
-            "# wait   css=#result               Wait for element\n"
-            "# scroll 500                       Scroll pixels\n"
-            "# hover  css=#menu                 Hover element\n"
-            "# select css=#drop  Option Text    Dropdown\n"
-            "# screenshot  capture.png          Save screenshot\n"
-            "# js     document.title            Run JavaScript\n")
+            "# Commands: action  locator  value\n"
+            "# click  css=#submit-btn\n"
+            "# type   id=search  Hello World\n"
+            "# keys   id=search  ENTER\n"
+            "# wait   2.0\n"
+            "# scroll 500\n"
+            "# hover  css=#menu\n"
+            "# select css=#drop  Option Text\n"
+            "# screenshot capture.png\n"
+            "# js     document.title\n")
 
+        # -- Run Controls --
         run_f = ctk.CTkFrame(tab)
         run_f.pack(fill="x", padx=12, pady=(4, 8))
         ctk.CTkButton(
@@ -1087,8 +1339,273 @@ class AutoClickerPro(ctk.CTk):
         self.web_delay_var = ctk.StringVar(value="1.0")
         ctk.CTkEntry(run_f, textvariable=self.web_delay_var, width=50).pack(
             side="left", padx=4)
+        ctk.CTkButton(
+            run_f, text="Save Script", width=90,
+            command=self._web_save_script
+        ).pack(side="left", padx=(12, 4))
+        ctk.CTkButton(
+            run_f, text="Load Script", width=90,
+            command=self._web_load_script
+        ).pack(side="left", padx=4)
 
     # -- Web helpers --
+
+    _PICK_JS = """
+    (function() {
+        if (window.__pickerActive) return 'ALREADY_ACTIVE';
+        window.__pickerActive = true;
+        window.__pickedSelector = null;
+        var overlay = document.createElement('div');
+        overlay.id = '__picker_overlay';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:999998;cursor:crosshair;';
+        var highlight = document.createElement('div');
+        highlight.id = '__picker_highlight';
+        highlight.style.cssText = 'position:fixed;z-index:999997;pointer-events:none;border:2px solid #f59e0b;background:rgba(245,158,11,0.15);transition:all 0.05s;display:none;';
+        var label = document.createElement('div');
+        label.id = '__picker_label';
+        label.style.cssText = 'position:fixed;z-index:999999;background:#1e293b;color:#f59e0b;font:12px monospace;padding:4px 8px;border-radius:4px;pointer-events:none;display:none;';
+        document.body.appendChild(highlight);
+        document.body.appendChild(label);
+        document.body.appendChild(overlay);
+
+        function bestSelector(el) {
+            if (el.id) return '#' + el.id;
+            if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
+            var cls = Array.from(el.classList).filter(function(c){return c.indexOf('__picker')===-1;});
+            if (cls.length) {
+                var sel = el.tagName.toLowerCase() + '.' + cls.join('.');
+                if (document.querySelectorAll(sel).length === 1) return sel;
+            }
+            var tag = el.tagName.toLowerCase();
+            var parent = el.parentElement;
+            if (!parent) return tag;
+            var siblings = Array.from(parent.children).filter(function(c){return c.tagName===el.tagName;});
+            if (siblings.length === 1) return bestSelector(parent) + ' > ' + tag;
+            var idx = siblings.indexOf(el) + 1;
+            return bestSelector(parent) + ' > ' + tag + ':nth-child(' + idx + ')';
+        }
+
+        overlay.addEventListener('mousemove', function(e) {
+            overlay.style.pointerEvents = 'none';
+            var target = document.elementFromPoint(e.clientX, e.clientY);
+            overlay.style.pointerEvents = 'auto';
+            if (!target || target.id && target.id.startsWith('__picker')) return;
+            var rect = target.getBoundingClientRect();
+            highlight.style.display = 'block';
+            highlight.style.left = rect.left + 'px';
+            highlight.style.top = rect.top + 'px';
+            highlight.style.width = rect.width + 'px';
+            highlight.style.height = rect.height + 'px';
+            var sel = bestSelector(target);
+            label.style.display = 'block';
+            label.textContent = sel;
+            label.style.left = Math.min(e.clientX + 12, window.innerWidth - 300) + 'px';
+            label.style.top = Math.max(e.clientY - 30, 4) + 'px';
+        });
+
+        overlay.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            overlay.style.pointerEvents = 'none';
+            var target = document.elementFromPoint(e.clientX, e.clientY);
+            overlay.style.pointerEvents = 'auto';
+            if (target && !(target.id && target.id.startsWith('__picker'))) {
+                window.__pickedSelector = bestSelector(target);
+            }
+            overlay.remove();
+            highlight.remove();
+            label.remove();
+            window.__pickerActive = false;
+        });
+        return 'PICKER_STARTED';
+    })();
+    """
+
+    _PICK_RESULT_JS = "return window.__pickedSelector;"
+
+    def _web_pick_element(self):
+        if not self.web_driver:
+            self._log("Launch a browser first.")
+            return
+        try:
+            result = self.web_driver.execute_script(self._PICK_JS)
+            if result == 'ALREADY_ACTIVE':
+                self._log("Picker already active. Click an element in the browser.")
+                return
+        except Exception as e:
+            self._log(f"Pick error: {e}")
+            return
+
+        self._log("Pick mode ON - click an element in the browser...")
+        self.web_pick_btn.configure(text="Waiting...", state="disabled")
+
+        def poll_pick():
+            for _ in range(300):  # 30 seconds timeout
+                time.sleep(0.1)
+                try:
+                    sel = self.web_driver.execute_script(self._PICK_RESULT_JS)
+                except Exception:
+                    break
+                if sel:
+                    self.after(0, lambda s=sel: self._web_pick_done(s))
+                    return
+            self.after(0, lambda: self._web_pick_done(None))
+
+        threading.Thread(target=poll_pick, daemon=True).start()
+
+    def _web_pick_done(self, selector):
+        self.web_pick_btn.configure(text="Pick Element", state="normal")
+        if selector:
+            self.web_locator_type.set("css=")
+            self.web_selector_var.set(selector)
+            self.web_selector_entry.configure(state="normal")
+            self._log(f"Picked: css={selector}")
+        else:
+            self._log("Pick cancelled or timed out.")
+
+    def _web_builder_update(self, action):
+        needs_locator = action in (
+            "click", "type", "keys", "clear", "submit",
+            "hover", "select", "gettext", "assert", "iframe")
+        no_locator = action in (
+            "wait", "scroll", "screenshot", "js", "navigate",
+            "alert", "back", "forward", "refresh")
+        state = "normal" if needs_locator else "disabled"
+        self.web_selector_entry.configure(state=state)
+        if no_locator:
+            self.web_locator_type.set("(none)")
+        elif self.web_locator_type.get() == "(none)":
+            self.web_locator_type.set("css=")
+
+    def _web_add_cmd(self):
+        action = self.web_action_var.get()
+        loc_type = self.web_locator_type.get()
+        selector = self.web_selector_var.get().strip()
+        value = self.web_value_var.get().strip()
+
+        if action in ("back", "forward", "refresh"):
+            line = action
+        elif action == "navigate":
+            line = f"navigate {value or self.web_url_var.get()}"
+        elif action in ("wait", "scroll"):
+            line = f"{action} {value or selector}"
+        elif action == "screenshot":
+            line = f"screenshot {value or 'capture.png'}"
+        elif action == "js":
+            line = f"js {value}"
+        elif action == "alert":
+            line = f"alert {value or 'accept'}"
+        elif action == "iframe":
+            locator = "" if loc_type == "(none)" else f"{loc_type}{selector}"
+            line = f"iframe {locator}" if locator else "iframe default"
+        else:
+            locator = "" if loc_type == "(none)" else f"{loc_type}{selector}"
+            if not locator:
+                self._log("Please enter a selector.")
+                return
+            if value:
+                line = f"{action} {locator} {value}"
+            else:
+                line = f"{action} {locator}"
+
+        self._web_insert_line(line)
+
+    _WEB_TEMPLATES = {
+        "login": (
+            "# === Login Template ===\n"
+            "# Edit the selectors & values below to match your site\n"
+            "navigate https://example.com/login\n"
+            "wait 1.0\n"
+            "type id=username your_username\n"
+            "type id=password your_password\n"
+            "click css=button[type=submit]\n"
+            "wait 2.0\n"
+            "screenshot login_result.png\n"
+        ),
+        "register": (
+            "# === Register Template ===\n"
+            "# Edit the selectors & values below to match your site\n"
+            "navigate https://example.com/register\n"
+            "wait 1.0\n"
+            "type id=firstname John\n"
+            "type id=lastname Doe\n"
+            "type id=email john@example.com\n"
+            "type id=username johndoe\n"
+            "type id=password MyPassword123\n"
+            "type id=confirm_password MyPassword123\n"
+            "click css=input[type=checkbox]\n"
+            "click css=button[type=submit]\n"
+            "wait 2.0\n"
+            "screenshot register_result.png\n"
+        ),
+        "search": (
+            "# === Search Template ===\n"
+            "navigate https://example.com\n"
+            "wait 1.0\n"
+            "type name=q search term here\n"
+            "keys name=q ENTER\n"
+            "wait 2.0\n"
+            "screenshot search_result.png\n"
+        ),
+        "form_fill": (
+            "# === Form Fill Template ===\n"
+            "navigate https://example.com/form\n"
+            "wait 1.0\n"
+            "type id=name John Doe\n"
+            "type id=email john@example.com\n"
+            "type id=phone 0123456789\n"
+            "type id=address 123 Main St\n"
+            "select id=country Thailand\n"
+            "click css=input[type=radio][value=male]\n"
+            "click css=input[type=checkbox]#agree\n"
+            "click css=button[type=submit]\n"
+            "wait 2.0\n"
+            "screenshot form_result.png\n"
+        ),
+        "scrape": (
+            "# === Scrape Text Template ===\n"
+            "navigate https://example.com\n"
+            "wait 1.0\n"
+            "gettext css=h1\n"
+            "gettext css=.price\n"
+            "gettext css=.description\n"
+            "screenshot scraped_page.png\n"
+        ),
+    }
+
+    def _web_load_template(self, name):
+        tpl = self._WEB_TEMPLATES.get(name, "")
+        if tpl:
+            self.web_script.delete("0.0", "end")
+            self.web_script.insert("0.0", tpl)
+            self._log(f"Template '{name}' loaded. Edit selectors to match your site.")
+
+    def _web_insert_line(self, text):
+        content = self.web_script.get("0.0", "end").strip()
+        if content and not content.endswith("\n"):
+            self.web_script.insert("end", "\n")
+        self.web_script.insert("end", text + "\n")
+
+    def _web_save_script(self):
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.web_script.get("0.0", "end").strip())
+            self._log(f"Script saved: {path}")
+
+    def _web_load_script(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if path:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.web_script.delete("0.0", "end")
+            self.web_script.insert("0.0", content)
+            self._log(f"Script loaded: {path}")
 
     def _web_launch(self):
         if self.web_driver:
@@ -1191,6 +1708,11 @@ class AutoClickerPro(ctk.CTk):
         return WebDriverWait(self.web_driver, timeout).until(
             EC.presence_of_element_located((by, val)))
 
+    def _web_find_clickable(self, locator, timeout=10):
+        by, val = self._web_parse_locator(locator)
+        return WebDriverWait(self.web_driver, timeout).until(
+            EC.element_to_be_clickable((by, val)))
+
     def _web_key(self, name):
         mapping = {
             "ENTER": Keys.ENTER, "RETURN": Keys.RETURN,
@@ -1216,9 +1738,19 @@ class AutoClickerPro(ctk.CTk):
         cmd = parts[0].lower()
 
         if cmd == "click":
-            self._web_find(parts[1]).click()
+            el = self._web_find_clickable(parts[1])
+            self.web_driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", el)
+            time.sleep(0.3)
+            try:
+                el.click()
+            except Exception:
+                self.web_driver.execute_script("arguments[0].click();", el)
         elif cmd == "type":
-            el = self._web_find(parts[1])
+            el = self._web_find_clickable(parts[1])
+            self.web_driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", el)
+            el.click()
             el.clear()
             el.send_keys(parts[2] if len(parts) > 2 else "")
         elif cmd == "keys":
@@ -1249,6 +1781,55 @@ class AutoClickerPro(ctk.CTk):
             script = line[2:].strip()
             result = self.web_driver.execute_script(f"return {script}")
             self._log(f"JS: {result}")
+        elif cmd == "navigate":
+            url = parts[1] if len(parts) > 1 else ""
+            if url:
+                self.web_driver.get(url)
+                self._log(f"Navigated to {url}")
+        elif cmd == "clear":
+            self._web_find(parts[1]).clear()
+        elif cmd == "submit":
+            self._web_find(parts[1]).submit()
+        elif cmd == "gettext":
+            el = self._web_find(parts[1])
+            text = el.text
+            self._log(f"Text: {text}")
+        elif cmd == "assert":
+            el = self._web_find(parts[1])
+            expected = parts[2] if len(parts) > 2 else ""
+            actual = el.text
+            if expected and expected not in actual:
+                self._log(f"ASSERT FAIL: expected '{expected}' in '{actual}'")
+                self.running = False
+                return
+            self._log(f"ASSERT OK: '{actual}'")
+        elif cmd == "iframe":
+            arg = parts[1] if len(parts) > 1 else "default"
+            if arg == "default":
+                self.web_driver.switch_to.default_content()
+                self._log("Switched to main page")
+            else:
+                frame = self._web_find(arg)
+                self.web_driver.switch_to.frame(frame)
+                self._log(f"Switched to iframe: {arg}")
+        elif cmd == "alert":
+            action = parts[1] if len(parts) > 1 else "accept"
+            alert = WebDriverWait(self.web_driver, 5).until(
+                EC.alert_is_present())
+            self._log(f"Alert text: {alert.text}")
+            if action == "dismiss":
+                alert.dismiss()
+            else:
+                alert.accept()
+        elif cmd == "back":
+            self.web_driver.back()
+            self._log("Navigated back")
+        elif cmd == "forward":
+            self.web_driver.forward()
+            self._log("Navigated forward")
+        elif cmd == "refresh":
+            self.web_driver.refresh()
+            self._log("Page refreshed")
         else:
             self._log(f"Unknown web cmd: {cmd}")
 
@@ -1793,6 +2374,30 @@ class AutoClickerPro(ctk.CTk):
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
+    # pynput key names -> pyautogui key names
+    _KEY_MAP = {
+        "ctrl_l": "ctrlleft", "ctrl_r": "ctrlright", "ctrl": "ctrl",
+        "alt_l": "altleft", "alt_r": "altright", "alt": "alt",
+        "alt_gr": "altright",
+        "shift_l": "shiftleft", "shift_r": "shiftright", "shift": "shift",
+        "cmd": "win", "cmd_l": "winleft", "cmd_r": "winright",
+        "caps_lock": "capslock", "num_lock": "numlock",
+        "scroll_lock": "scrolllock",
+        "page_up": "pageup", "page_down": "pagedown",
+        "print_screen": "printscreen",
+        "enter": "enter", "return": "return",
+        "space": "space", "tab": "tab",
+        "backspace": "backspace", "delete": "delete",
+        "up": "up", "down": "down", "left": "left", "right": "right",
+        "home": "home", "end": "end",
+        "esc": "escape", "escape": "escape",
+        "insert": "insert",
+        "menu": "apps",
+    }
+
+    def _map_key(self, key_str):
+        return self._KEY_MAP.get(key_str, key_str)
+
     def _stop(self):
         self.running = False
         self._log("Stopped.")
@@ -1805,6 +2410,8 @@ class AutoClickerPro(ctk.CTk):
         kb_hotkey.add_hotkey(HOTKEY_START_STOP, self._hotkey_toggle)
         kb_hotkey.add_hotkey(HOTKEY_RECORD, self._toggle_record)
         kb_hotkey.add_hotkey(HOTKEY_PICK, self._pick_coordinate)
+        kb_hotkey.add_hotkey(HOTKEY_REPLAY, self._start_replay)
+        kb_hotkey.add_hotkey(HOTKEY_STOP, self._stop)
 
     def _hotkey_toggle(self):
         if self.running:
