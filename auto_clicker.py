@@ -22,6 +22,7 @@ from pynput import mouse as pynput_mouse, keyboard as pynput_kb
 import threading
 import time
 import json
+import csv
 import os
 import copy
 import random
@@ -209,6 +210,10 @@ class AutoClickerPro(ctk.CTk):
         self._kb_listener = None
         self._last_move_t = 0
         self.web_driver = None
+        self.web_scraped_data = []
+        self.web_form_fields = []
+        self.web_error_policy = "stop"
+        self._web_retry_count = 0
         self.macro_steps = []
         self.scheduled_tasks = []
         self._scheduler_active = True
@@ -1169,47 +1174,238 @@ class AutoClickerPro(ctk.CTk):
             ).pack()
             return
 
-        ctk.CTkLabel(tab, text="Browser Automation (Selenium)",
-                     font=("Segoe UI", 14, "bold")).pack(
-            anchor="w", padx=12, pady=(8, 4))
+        # -- Persistent top bar --
+        top_bar = ctk.CTkFrame(tab, fg_color="gray14")
+        top_bar.pack(fill="x", padx=8, pady=(6, 2))
 
-        url_f = ctk.CTkFrame(tab)
-        url_f.pack(fill="x", padx=12, pady=4)
-        ctk.CTkLabel(url_f, text="URL:").pack(side="left", padx=4)
+        ctk.CTkLabel(top_bar, text="URL:").pack(side="left", padx=4)
         self.web_url_var = ctk.StringVar(value="https://")
-        ctk.CTkEntry(url_f, textvariable=self.web_url_var, width=300).pack(
+        ctk.CTkEntry(top_bar, textvariable=self.web_url_var, width=260).pack(
             side="left", padx=4)
-        ctk.CTkLabel(url_f, text="Browser:").pack(side="left", padx=(8, 4))
-        self.web_browser = ctk.CTkOptionMenu(
-            url_f, values=["Chrome", "Edge", "Firefox"], width=100)
-        self.web_browser.set("Chrome")
-        self.web_browser.pack(side="left", padx=4)
-        self.web_headless_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(url_f, text="Headless",
-                        variable=self.web_headless_var).pack(
-            side="left", padx=8)
 
-        launch_f = ctk.CTkFrame(tab)
-        launch_f.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(top_bar, text="Browser:").pack(side="left", padx=(6, 2))
+        self.web_browser = ctk.CTkOptionMenu(
+            top_bar, values=["Chrome", "Edge", "Firefox"], width=90)
+        self.web_browser.set("Chrome")
+        self.web_browser.pack(side="left", padx=2)
+
+        self.web_headless_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(top_bar, text="Headless",
+                        variable=self.web_headless_var, width=70).pack(
+            side="left", padx=4)
+
         ctk.CTkButton(
-            launch_f, text="Launch Browser",
+            top_bar, text="Launch", fg_color="#22c55e", hover_color="#16a34a",
+            width=70, command=self._web_launch
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            top_bar, text="Close", fg_color="#ef4444", hover_color="#dc2626",
+            width=60, command=self._web_close
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            top_bar, text="Go", width=40, command=self._web_navigate
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            top_bar, text="Back", width=45, fg_color="gray30",
+            command=lambda: self._web_nav_action("back")
+        ).pack(side="left", padx=1)
+        ctk.CTkButton(
+            top_bar, text="Fwd", width=45, fg_color="gray30",
+            command=lambda: self._web_nav_action("forward")
+        ).pack(side="left", padx=1)
+        ctk.CTkButton(
+            top_bar, text="Refresh", width=55, fg_color="gray30",
+            command=lambda: self._web_nav_action("refresh")
+        ).pack(side="left", padx=1)
+
+        # -- Nested sub-tabs --
+        self._web_subtabs = ctk.CTkTabview(tab, anchor="nw")
+        self._web_subtabs.pack(fill="both", expand=True, padx=8, pady=(2, 4))
+
+        self._build_web_quick_actions_subtab()
+        self._build_web_forms_subtab()
+        self._build_web_scraper_subtab()
+        self._build_web_workflow_subtab()
+
+    # ---- Web sub-tab builders ----
+
+    def _build_web_quick_actions_subtab(self):
+        stab = self._web_subtabs.add("Quick Actions")
+
+        grid_f = ctk.CTkFrame(stab)
+        grid_f.pack(fill="both", expand=True, padx=12, pady=8)
+
+        actions = [
+            ("Click Element", "click", "#3b82f6"),
+            ("Type Text", "type", "#22c55e"),
+            ("Scroll Page", "scroll", "#8b5cf6"),
+            ("Take Screenshot", "screenshot", "#f59e0b"),
+            ("Navigate URL", "navigate", "#3b82f6"),
+            ("Pick Element", "pick", "#f59e0b"),
+        ]
+        for idx, (label, action_id, color) in enumerate(actions):
+            r, c = divmod(idx, 3)
+            ctk.CTkButton(
+                grid_f, text=label, width=180, height=60,
+                font=("Segoe UI", 13, "bold"),
+                fg_color=color, hover_color="gray30",
+                command=lambda a=action_id: self._web_quick_action(a)
+            ).grid(row=r, column=c, padx=10, pady=10)
+
+        for i in range(3):
+            grid_f.columnconfigure(i, weight=1)
+
+        self._web_quick_status = ctk.CTkLabel(
+            stab, text="Ready", text_color="gray60",
+            font=("Consolas", 11))
+        self._web_quick_status.pack(anchor="w", padx=12, pady=(0, 6))
+
+    def _build_web_forms_subtab(self):
+        stab = self._web_subtabs.add("Form Filler")
+
+        btn_row = ctk.CTkFrame(stab)
+        btn_row.pack(fill="x", padx=12, pady=(8, 4))
+
+        ctk.CTkButton(
+            btn_row, text="Detect Forms", width=120,
+            fg_color="#3b82f6", hover_color="#2563eb",
+            command=self._web_detect_forms
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btn_row, text="Clear", width=70, fg_color="gray30",
+            command=self._web_clear_form_fields
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            btn_row, text="Fill && Submit", width=120,
             fg_color="#22c55e", hover_color="#16a34a",
-            width=130, command=self._web_launch
+            command=self._web_fill_and_submit
+        ).pack(side="left", padx=4)
+
+        self.web_form_confirm_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            btn_row, text="Confirm before submit",
+            variable=self.web_form_confirm_var
+        ).pack(side="left", padx=12)
+
+        tree_f = ctk.CTkFrame(stab)
+        tree_f.pack(fill="both", expand=True, padx=12, pady=4)
+
+        cols = ("field", "type", "locator", "value")
+        self.web_form_tree = ttk.Treeview(
+            tree_f, columns=cols, show="headings",
+            height=10, style="Dark.Treeview")
+        for c, w, txt in zip(
+            cols, [140, 80, 200, 180],
+            ["Field", "Type", "Locator", "Value"]
+        ):
+            self.web_form_tree.heading(c, text=txt)
+            self.web_form_tree.column(c, width=w,
+                                      anchor="w" if c != "type" else "center")
+        self.web_form_tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(
+            tree_f, orient="vertical", command=self.web_form_tree.yview)
+        sb.pack(side="right", fill="y")
+        self.web_form_tree.configure(yscrollcommand=sb.set)
+        self.web_form_tree.bind("<Double-1>", self._web_edit_form_field)
+
+    def _build_web_scraper_subtab(self):
+        stab = self._web_subtabs.add("Scraper")
+
+        # -- Extract row --
+        ext_f = ctk.CTkFrame(stab)
+        ext_f.pack(fill="x", padx=12, pady=(8, 4))
+        ctk.CTkLabel(ext_f, text="CSS Selector:").pack(side="left", padx=4)
+        self.web_scrape_selector_var = ctk.StringVar()
+        ctk.CTkEntry(
+            ext_f, textvariable=self.web_scrape_selector_var,
+            placeholder_text="e.g. h1, .price, table", width=220
         ).pack(side="left", padx=4)
         ctk.CTkButton(
-            launch_f, text="Close Browser",
-            fg_color="#ef4444", hover_color="#dc2626",
-            width=130, command=self._web_close
+            ext_f, text="Extract Text", width=100,
+            fg_color="#22c55e", hover_color="#16a34a",
+            command=self._web_scrape_text
+        ).pack(side="left", padx=3)
+        ctk.CTkButton(
+            ext_f, text="Extract Table", width=100,
+            fg_color="#3b82f6", hover_color="#2563eb",
+            command=self._web_scrape_table
+        ).pack(side="left", padx=3)
+        ctk.CTkButton(
+            ext_f, text="Pick", width=55,
+            fg_color="#f59e0b", hover_color="#d97706",
+            command=self._web_pick_element
+        ).pack(side="left", padx=3)
+
+        # -- Compare row --
+        cmp_f = ctk.CTkFrame(stab)
+        cmp_f.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(cmp_f, text="Compare URLs (one per line):").pack(
+            anchor="w", padx=4)
+        self.web_compare_urls = ctk.CTkTextbox(cmp_f, height=50,
+                                                font=("Consolas", 10))
+        self.web_compare_urls.pack(fill="x", padx=4, pady=2)
+        cmp_row2 = ctk.CTkFrame(cmp_f)
+        cmp_row2.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(cmp_row2, text="Compare Selector:").pack(
+            side="left", padx=2)
+        self.web_compare_sel_var = ctk.StringVar()
+        ctk.CTkEntry(
+            cmp_row2, textvariable=self.web_compare_sel_var,
+            placeholder_text="e.g. .price", width=180
         ).pack(side="left", padx=4)
-        ctk.CTkButton(launch_f, text="Navigate", width=90,
-                      command=self._web_navigate).pack(side="left", padx=4)
+        ctk.CTkButton(
+            cmp_row2, text="Compare Pages", width=120,
+            fg_color="#8b5cf6", hover_color="#7c3aed",
+            command=self._web_compare_pages
+        ).pack(side="left", padx=4)
+
+        # -- Results tree --
+        tree_f = ctk.CTkFrame(stab)
+        tree_f.pack(fill="both", expand=True, padx=12, pady=4)
+        cols = ("source", "selector", "text")
+        self.web_scrape_tree = ttk.Treeview(
+            tree_f, columns=cols, show="headings",
+            height=8, style="Dark.Treeview")
+        for c, w, txt in zip(
+            cols, [200, 160, 300],
+            ["Source / URL", "Selector", "Extracted Text"]
+        ):
+            self.web_scrape_tree.heading(c, text=txt)
+            self.web_scrape_tree.column(c, width=w, anchor="w")
+        self.web_scrape_tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(
+            tree_f, orient="vertical", command=self.web_scrape_tree.yview)
+        sb.pack(side="right", fill="y")
+        self.web_scrape_tree.configure(yscrollcommand=sb.set)
+
+        # -- Export buttons --
+        exp_f = ctk.CTkFrame(stab)
+        exp_f.pack(fill="x", padx=12, pady=(4, 8))
+        ctk.CTkButton(
+            exp_f, text="Export CSV", width=90,
+            fg_color="#22c55e", hover_color="#16a34a",
+            command=self._web_export_csv
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            exp_f, text="Export JSON", width=90,
+            fg_color="#3b82f6", hover_color="#2563eb",
+            command=self._web_export_json
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            exp_f, text="Clear Results", width=100,
+            fg_color="#ef4444", hover_color="#dc2626",
+            command=self._web_clear_scraped
+        ).pack(side="left", padx=4)
+
+    def _build_web_workflow_subtab(self):
+        stab = self._web_subtabs.add("Workflow")
 
         # -- Command Builder --
-        ctk.CTkLabel(tab, text="Command Builder",
+        ctk.CTkLabel(stab, text="Command Builder",
                      font=("Segoe UI", 12, "bold"),
-                     text_color="gray70").pack(anchor="w", padx=12, pady=(8, 2))
+                     text_color="gray70").pack(anchor="w", padx=12, pady=(6, 2))
 
-        builder_f = ctk.CTkFrame(tab)
+        builder_f = ctk.CTkFrame(stab)
         builder_f.pack(fill="x", padx=12, pady=4)
 
         ctk.CTkLabel(builder_f, text="Action:").grid(
@@ -1221,8 +1417,11 @@ class AutoClickerPro(ctk.CTk):
                     "wait", "scroll", "hover", "select",
                     "gettext", "assert", "iframe", "alert",
                     "screenshot", "js", "navigate",
-                    "back", "forward", "refresh"],
-            variable=self.web_action_var, width=110,
+                    "back", "forward", "refresh",
+                    "confirm", "pause", "on_error", "retry",
+                    "extract_text", "save_csv", "upload",
+                    "new_tab", "switch_tab", "foreach_page"],
+            variable=self.web_action_var, width=120,
             command=self._web_builder_update)
         self.web_action_menu.grid(row=0, column=1, padx=4, pady=2)
 
@@ -1261,7 +1460,7 @@ class AutoClickerPro(ctk.CTk):
         self.web_pick_btn.grid(row=0, column=8, padx=4, pady=2)
 
         # -- Templates --
-        tpl_f = ctk.CTkFrame(tab)
+        tpl_f = ctk.CTkFrame(stab)
         tpl_f.pack(fill="x", padx=12, pady=2)
         ctk.CTkLabel(tpl_f, text="Templates:",
                      font=("Segoe UI", 11, "bold")).pack(side="left", padx=4)
@@ -1270,17 +1469,17 @@ class AutoClickerPro(ctk.CTk):
             ("Register", "register"),
             ("Search", "search"),
             ("Form Fill", "form_fill"),
-            ("Scrape Text", "scrape"),
+            ("Scrape", "scrape"),
         ]:
             ctk.CTkButton(
-                tpl_f, text=label, width=80, height=26,
+                tpl_f, text=label, width=75, height=26,
                 font=("Segoe UI", 11),
                 fg_color="#6366f1", hover_color="#4f46e5",
                 command=lambda t=tpl_name: self._web_load_template(t)
             ).pack(side="left", padx=2)
 
         # -- Quick Insert Buttons --
-        quick_f = ctk.CTkFrame(tab)
+        quick_f = ctk.CTkFrame(stab)
         quick_f.pack(fill="x", padx=12, pady=2)
         for label, cmd_text in [
             ("Click", "click css=#element"),
@@ -1291,6 +1490,9 @@ class AutoClickerPro(ctk.CTk):
             ("Screenshot", "screenshot capture.png"),
             ("Back", "back"),
             ("Refresh", "refresh"),
+            ("Confirm", "confirm Continue?"),
+            ("Pause", "pause"),
+            ("Upload", "upload css=input[type=file] C:/file.txt"),
         ]:
             ctk.CTkButton(
                 quick_f, text=label, width=75, height=26,
@@ -1304,8 +1506,22 @@ class AutoClickerPro(ctk.CTk):
             command=lambda: self.web_script.delete("0.0", "end")
         ).pack(side="left", padx=2)
 
+        # -- Error handling row --
+        err_f = ctk.CTkFrame(stab)
+        err_f.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(err_f, text="On Error:").pack(side="left", padx=4)
+        self.web_error_var = ctk.StringVar(value="stop")
+        ctk.CTkOptionMenu(
+            err_f, values=["stop", "continue", "pause"],
+            variable=self.web_error_var, width=100
+        ).pack(side="left", padx=4)
+        ctk.CTkLabel(err_f, text="Max Retries:").pack(side="left", padx=(12, 4))
+        self.web_max_retry_var = ctk.StringVar(value="0")
+        ctk.CTkEntry(err_f, textvariable=self.web_max_retry_var, width=50).pack(
+            side="left", padx=4)
+
         # -- Script Editor --
-        self.web_script = ctk.CTkTextbox(tab, font=("Consolas", 11))
+        self.web_script = ctk.CTkTextbox(stab, font=("Consolas", 11))
         self.web_script.pack(fill="both", expand=True, padx=12, pady=4)
         self.web_script.insert("0.0",
             "# Commands: action  locator  value\n"
@@ -1317,10 +1533,21 @@ class AutoClickerPro(ctk.CTk):
             "# hover  css=#menu\n"
             "# select css=#drop  Option Text\n"
             "# screenshot capture.png\n"
-            "# js     document.title\n")
+            "# js     document.title\n"
+            "# confirm  Proceed?\n"
+            "# pause\n"
+            "# on_error continue\n"
+            "# retry 3\n"
+            "# extract_text css=.result\n"
+            "# save_csv results.csv\n"
+            "# upload css=input[type=file] C:/file.txt\n"
+            "# new_tab https://example.com\n"
+            "# switch_tab 0\n"
+            "# foreach_page url1 url2\n"
+            "# end_foreach\n")
 
         # -- Run Controls --
-        run_f = ctk.CTkFrame(tab)
+        run_f = ctk.CTkFrame(stab)
         run_f.pack(fill="x", padx=12, pady=(4, 8))
         ctk.CTkButton(
             run_f, text="Run Script", fg_color="#22c55e",
@@ -1466,10 +1693,13 @@ class AutoClickerPro(ctk.CTk):
     def _web_builder_update(self, action):
         needs_locator = action in (
             "click", "type", "keys", "clear", "submit",
-            "hover", "select", "gettext", "assert", "iframe")
+            "hover", "select", "gettext", "assert", "iframe",
+            "extract_text", "upload")
         no_locator = action in (
             "wait", "scroll", "screenshot", "js", "navigate",
-            "alert", "back", "forward", "refresh")
+            "alert", "back", "forward", "refresh",
+            "confirm", "pause", "on_error", "retry",
+            "save_csv", "new_tab", "switch_tab", "foreach_page")
         state = "normal" if needs_locator else "disabled"
         self.web_selector_entry.configure(state=state)
         if no_locator:
@@ -1483,7 +1713,7 @@ class AutoClickerPro(ctk.CTk):
         selector = self.web_selector_var.get().strip()
         value = self.web_value_var.get().strip()
 
-        if action in ("back", "forward", "refresh"):
+        if action in ("back", "forward", "refresh", "pause"):
             line = action
         elif action == "navigate":
             line = f"navigate {value or self.web_url_var.get()}"
@@ -1498,6 +1728,20 @@ class AutoClickerPro(ctk.CTk):
         elif action == "iframe":
             locator = "" if loc_type == "(none)" else f"{loc_type}{selector}"
             line = f"iframe {locator}" if locator else "iframe default"
+        elif action == "confirm":
+            line = f"confirm {value or 'Continue?'}"
+        elif action == "on_error":
+            line = f"on_error {value or 'stop'}"
+        elif action == "retry":
+            line = f"retry {value or '3'}"
+        elif action == "save_csv":
+            line = f"save_csv {value or 'results.csv'}"
+        elif action == "new_tab":
+            line = f"new_tab {value or 'about:blank'}"
+        elif action == "switch_tab":
+            line = f"switch_tab {value or '0'}"
+        elif action == "foreach_page":
+            line = f"foreach_page {value}"
         else:
             locator = "" if loc_type == "(none)" else f"{loc_type}{selector}"
             if not locator:
@@ -1830,6 +2074,94 @@ class AutoClickerPro(ctk.CTk):
         elif cmd == "refresh":
             self.web_driver.refresh()
             self._log("Page refreshed")
+        elif cmd == "confirm":
+            msg = line[len("confirm"):].strip() or "Continue?"
+            result = [None]
+            event = threading.Event()
+
+            def ask_confirm():
+                result[0] = messagebox.askyesno("Confirm", msg)
+                event.set()
+
+            self.after(0, ask_confirm)
+            event.wait()
+            if not result[0]:
+                self._log("Aborted by user at confirm step.")
+                self.running = False
+                return
+            self._log("Confirmed.")
+        elif cmd == "pause":
+            event = threading.Event()
+
+            def show_pause():
+                messagebox.showinfo("Paused",
+                                    "Script paused. Click OK to continue.")
+                event.set()
+
+            self.after(0, show_pause)
+            event.wait()
+            self._log("Resumed from pause.")
+        elif cmd == "on_error":
+            policy = parts[1] if len(parts) > 1 else "stop"
+            self.web_error_policy = policy
+            self._log(f"Error policy set to: {policy}")
+        elif cmd == "retry":
+            count = int(parts[1]) if len(parts) > 1 else 0
+            self._web_retry_count = count
+            self._log(f"Max retries set to: {count}")
+        elif cmd == "extract_text":
+            locator = parts[1] if len(parts) > 1 else ""
+            if not locator:
+                self._log("extract_text requires a locator.")
+                return
+            by, val = self._web_parse_locator(locator)
+            elements = self.web_driver.find_elements(by, val)
+            url = self.web_driver.current_url
+            for el in elements:
+                txt = el.text.strip()
+                if txt:
+                    self.web_scraped_data.append({
+                        "source": url, "selector": locator, "text": txt})
+            self._log(
+                f"Extracted text from {len(elements)} element(s): {locator}")
+        elif cmd == "save_csv":
+            fname = parts[1] if len(parts) > 1 else "scraped.csv"
+            try:
+                with open(fname, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(
+                        f, fieldnames=["source", "selector", "text"])
+                    writer.writeheader()
+                    writer.writerows(self.web_scraped_data)
+                self._log(f"Saved {len(self.web_scraped_data)} row(s) to {fname}")
+            except Exception as e:
+                self._log(f"save_csv error: {e}")
+        elif cmd == "upload":
+            locator = parts[1] if len(parts) > 1 else ""
+            filepath = parts[2] if len(parts) > 2 else ""
+            if not locator or not filepath:
+                self._log("upload requires locator and filepath.")
+                return
+            el = self._web_find(locator)
+            el.send_keys(filepath)
+            self._log(f"Uploaded file: {filepath}")
+        elif cmd == "new_tab":
+            url = parts[1] if len(parts) > 1 else "about:blank"
+            self.web_driver.execute_script(f"window.open('{url}');")
+            handles = self.web_driver.window_handles
+            self.web_driver.switch_to.window(handles[-1])
+            self._log(f"Opened new tab: {url}")
+        elif cmd == "switch_tab":
+            idx = int(parts[1]) if len(parts) > 1 else 0
+            handles = self.web_driver.window_handles
+            if 0 <= idx < len(handles):
+                self.web_driver.switch_to.window(handles[idx])
+                self._log(f"Switched to tab {idx}")
+            else:
+                self._log(f"Tab index {idx} out of range (0-{len(handles)-1})")
+        elif cmd == "foreach_page":
+            pass  # handled in _web_run_script
+        elif cmd == "end_foreach":
+            pass  # handled in _web_run_script
         else:
             self._log(f"Unknown web cmd: {cmd}")
 
@@ -1841,27 +2173,82 @@ class AutoClickerPro(ctk.CTk):
         if self.running:
             return
         text = self.web_script.get("0.0", "end").strip()
-        lines = [l for l in text.splitlines()
-                 if l.strip() and not l.strip().startswith("#")]
-        if not lines:
+        all_lines = text.splitlines()
+        if not any(l.strip() and not l.strip().startswith("#")
+                   for l in all_lines):
             return
 
         loops = int(self.web_loops_var.get() or 1)
         delay = float(self.web_delay_var.get() or 1.0)
 
+        # Read error policy / retries from UI
+        self.web_error_policy = self.web_error_var.get()
+        self._web_retry_count = int(self.web_max_retry_var.get() or 0)
+
         def worker():
             self._log(
-                f"Web script: {len(lines)} actions x {loops} loops")
+                f"Web script: {len(all_lines)} line(s) x {loops} loops"
+                f" [on_error={self.web_error_policy},"
+                f" retries={self._web_retry_count}]")
+
             for lp in range(loops):
-                for i, line in enumerate(lines):
+                i = 0
+                while i < len(all_lines):
                     if not self.running:
                         break
-                    try:
-                        self._web_exec_line(line)
-                    except Exception as e:
-                        self._log(f"Web error line {i+1}: {e}")
-                        self.running = False
-                        return
+                    line = all_lines[i].strip()
+
+                    # Skip blanks and comments
+                    if not line or line.startswith("#"):
+                        i += 1
+                        continue
+
+                    parts = line.split()
+                    cmd = parts[0].lower()
+
+                    # Handle foreach_page block
+                    if cmd == "foreach_page":
+                        urls = parts[1:]
+                        # Find matching end_foreach
+                        block_start = i + 1
+                        block_end = None
+                        for j in range(block_start, len(all_lines)):
+                            if all_lines[j].strip().lower() == "end_foreach":
+                                block_end = j
+                                break
+                        if block_end is None:
+                            self._log(
+                                "foreach_page without end_foreach")
+                            self.running = False
+                            return
+                        block_lines = all_lines[block_start:block_end]
+                        for url in urls:
+                            if not self.running:
+                                break
+                            try:
+                                self.web_driver.get(url)
+                                self._log(f"foreach_page: {url}")
+                                time.sleep(1)
+                            except Exception as e:
+                                self._log(
+                                    f"foreach_page nav error: {e}")
+                                continue
+                            for bl in block_lines:
+                                bl = bl.strip()
+                                if not bl or bl.startswith("#"):
+                                    continue
+                                if not self.running:
+                                    break
+                                self._exec_with_retry(bl)
+                        i = block_end + 1
+                        continue
+
+                    # Normal line execution with retry
+                    self._exec_with_retry(line)
+                    if not self.running:
+                        break
+                    i += 1
+
                 if not self.running:
                     break
                 if lp < loops - 1:
@@ -1870,6 +2257,488 @@ class AutoClickerPro(ctk.CTk):
             self._log("Web script done.")
 
         self._run_thread(worker)
+
+    def _exec_with_retry(self, line):
+        """Execute a single line with retry and error policy support."""
+        max_tries = max(1, self._web_retry_count + 1)
+        for attempt in range(max_tries):
+            try:
+                self._web_exec_line(line)
+                return  # success
+            except Exception as e:
+                is_last = (attempt >= max_tries - 1)
+                if not is_last:
+                    self._log(
+                        f"Retry {attempt+1}/{self._web_retry_count}"
+                        f" for: {line[:60]}  ({e})")
+                    time.sleep(0.5)
+                    continue
+
+                # Last attempt failed - apply error policy
+                self._log(f"Web error: {e}  |  line: {line[:80]}")
+                policy = self.web_error_policy
+                if policy == "continue":
+                    self._log("Continuing (on_error=continue)...")
+                    return
+                elif policy == "pause":
+                    self._log("Paused on error. Waiting for user...")
+                    event = threading.Event()
+
+                    def show_err():
+                        messagebox.showwarning(
+                            "Script Error",
+                            f"Error: {e}\n\nLine: {line[:120]}\n\n"
+                            "Click OK to continue.")
+                        event.set()
+
+                    self.after(0, show_err)
+                    event.wait()
+                    self._log("Resumed after error pause.")
+                    return
+                else:  # "stop"
+                    self.running = False
+                    return
+
+    # -- Navigation helpers --
+
+    def _web_nav_action(self, action):
+        if not self.web_driver:
+            self._log("Launch a browser first.")
+            return
+        try:
+            if action == "back":
+                self.web_driver.back()
+            elif action == "forward":
+                self.web_driver.forward()
+            elif action == "refresh":
+                self.web_driver.refresh()
+            self._log(f"Nav: {action}")
+        except Exception as e:
+            self._log(f"Nav error: {e}")
+
+    # -- Quick Actions handler --
+
+    def _web_quick_action(self, action_id):
+        if action_id == "pick":
+            self._web_pick_element()
+            return
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(f"Quick Action: {action_id}")
+        dlg.geometry("420x200")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        if action_id == "click":
+            ctk.CTkLabel(dlg, text="Locator (e.g. css=#btn):").pack(
+                anchor="w", padx=12, pady=(12, 2))
+            loc_var = ctk.StringVar()
+            ctk.CTkEntry(dlg, textvariable=loc_var, width=360).pack(
+                padx=12, anchor="w")
+
+            def do_click():
+                dlg.destroy()
+                if not self.web_driver:
+                    self._log("Launch a browser first.")
+                    return
+                try:
+                    self._web_exec_line(f"click {loc_var.get()}")
+                    self._log(f"Quick click: {loc_var.get()}")
+                    self.after(0, lambda: self._web_quick_status.configure(
+                        text=f"Clicked: {loc_var.get()}"))
+                except Exception as e:
+                    self._log(f"Quick click error: {e}")
+
+            ctk.CTkButton(dlg, text="Execute", fg_color="#22c55e",
+                          command=do_click).pack(pady=12)
+
+        elif action_id == "type":
+            ctk.CTkLabel(dlg, text="Locator:").pack(
+                anchor="w", padx=12, pady=(12, 2))
+            loc_var = ctk.StringVar()
+            ctk.CTkEntry(dlg, textvariable=loc_var, width=360).pack(
+                padx=12, anchor="w")
+            ctk.CTkLabel(dlg, text="Text:").pack(
+                anchor="w", padx=12, pady=(6, 2))
+            txt_var = ctk.StringVar()
+            ctk.CTkEntry(dlg, textvariable=txt_var, width=360).pack(
+                padx=12, anchor="w")
+
+            def do_type():
+                dlg.destroy()
+                if not self.web_driver:
+                    self._log("Launch a browser first.")
+                    return
+                try:
+                    self._web_exec_line(
+                        f"type {loc_var.get()} {txt_var.get()}")
+                    self._log(f"Quick type into {loc_var.get()}")
+                    self.after(0, lambda: self._web_quick_status.configure(
+                        text=f"Typed into: {loc_var.get()}"))
+                except Exception as e:
+                    self._log(f"Quick type error: {e}")
+
+            ctk.CTkButton(dlg, text="Execute", fg_color="#22c55e",
+                          command=do_type).pack(pady=12)
+
+        elif action_id == "scroll":
+            ctk.CTkLabel(dlg, text="Scroll amount (px):").pack(
+                anchor="w", padx=12, pady=(12, 2))
+            amt_var = ctk.StringVar(value="300")
+            ctk.CTkEntry(dlg, textvariable=amt_var, width=120).pack(
+                padx=12, anchor="w")
+
+            def do_scroll():
+                dlg.destroy()
+                if not self.web_driver:
+                    self._log("Launch a browser first.")
+                    return
+                try:
+                    self._web_exec_line(f"scroll {amt_var.get()}")
+                    self._log(f"Quick scroll: {amt_var.get()}px")
+                    self.after(0, lambda: self._web_quick_status.configure(
+                        text=f"Scrolled {amt_var.get()}px"))
+                except Exception as e:
+                    self._log(f"Quick scroll error: {e}")
+
+            ctk.CTkButton(dlg, text="Execute", fg_color="#22c55e",
+                          command=do_scroll).pack(pady=12)
+
+        elif action_id == "screenshot":
+            ctk.CTkLabel(dlg, text="Filename:").pack(
+                anchor="w", padx=12, pady=(12, 2))
+            fn_var = ctk.StringVar(value="screenshot.png")
+            ctk.CTkEntry(dlg, textvariable=fn_var, width=360).pack(
+                padx=12, anchor="w")
+
+            def do_screenshot():
+                dlg.destroy()
+                if not self.web_driver:
+                    self._log("Launch a browser first.")
+                    return
+                try:
+                    self._web_exec_line(f"screenshot {fn_var.get()}")
+                    self._log(f"Quick screenshot: {fn_var.get()}")
+                    self.after(0, lambda: self._web_quick_status.configure(
+                        text=f"Screenshot saved: {fn_var.get()}"))
+                except Exception as e:
+                    self._log(f"Quick screenshot error: {e}")
+
+            ctk.CTkButton(dlg, text="Execute", fg_color="#22c55e",
+                          command=do_screenshot).pack(pady=12)
+
+        elif action_id == "navigate":
+            ctk.CTkLabel(dlg, text="URL:").pack(
+                anchor="w", padx=12, pady=(12, 2))
+            url_var = ctk.StringVar(value=self.web_url_var.get())
+            ctk.CTkEntry(dlg, textvariable=url_var, width=360).pack(
+                padx=12, anchor="w")
+
+            def do_navigate():
+                dlg.destroy()
+                if not self.web_driver:
+                    self._log("Launch a browser first.")
+                    return
+                try:
+                    self._web_exec_line(f"navigate {url_var.get()}")
+                    self.after(0, lambda: self._web_quick_status.configure(
+                        text=f"Navigated: {url_var.get()}"))
+                except Exception as e:
+                    self._log(f"Quick navigate error: {e}")
+
+            ctk.CTkButton(dlg, text="Execute", fg_color="#22c55e",
+                          command=do_navigate).pack(pady=12)
+
+    # -- Form Filler methods --
+
+    def _web_detect_forms(self):
+        if not self.web_driver:
+            self._log("Launch a browser first.")
+            return
+        try:
+            js = """
+            var results = [];
+            var inputs = document.querySelectorAll('input, textarea, select');
+            inputs.forEach(function(el) {
+                var name = el.name || el.id || '';
+                var id = el.id || '';
+                var tag = el.tagName.toLowerCase();
+                var etype = el.type || tag;
+                var label = '';
+                if (id) {
+                    var lbl = document.querySelector('label[for=\"' + id + '\"]');
+                    if (lbl) label = lbl.textContent.trim();
+                }
+                var locator = '';
+                if (id) locator = 'id=' + id;
+                else if (el.name) locator = 'name=' + el.name;
+                else {
+                    var cls = Array.from(el.classList).join('.');
+                    if (cls) locator = 'css=' + tag + '.' + cls;
+                    else locator = 'css=' + tag;
+                }
+                results.push({
+                    name: label || name || tag,
+                    type: etype,
+                    locator: locator,
+                    value: el.value || ''
+                });
+            });
+            return results;
+            """
+            fields = self.web_driver.execute_script(js)
+            self.web_form_fields = []
+            for f in (fields or []):
+                self.web_form_fields.append({
+                    "field": f.get("name", ""),
+                    "type": f.get("type", ""),
+                    "locator": f.get("locator", ""),
+                    "value": f.get("value", ""),
+                })
+            self._web_refresh_form_tree()
+            self._log(f"Detected {len(self.web_form_fields)} form field(s).")
+        except Exception as e:
+            self._log(f"Detect forms error: {e}")
+
+    def _web_edit_form_field(self, event):
+        sel = self.web_form_tree.selection()
+        if not sel:
+            return
+        idx = list(self.web_form_tree.get_children()).index(sel[0])
+        field = self.web_form_fields[idx]
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Edit Field Value")
+        dlg.geometry("350x130")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ctk.CTkLabel(dlg, text=f"Field: {field['field']} ({field['type']})").pack(
+            anchor="w", padx=12, pady=(12, 4))
+        val_var = ctk.StringVar(value=field["value"])
+        ctk.CTkEntry(dlg, textvariable=val_var, width=300).pack(padx=12)
+
+        def save():
+            self.web_form_fields[idx]["value"] = val_var.get()
+            self._web_refresh_form_tree()
+            dlg.destroy()
+
+        ctk.CTkButton(dlg, text="OK", width=80, command=save).pack(pady=10)
+
+    def _web_clear_form_fields(self):
+        self.web_form_fields = []
+        self._web_refresh_form_tree()
+        self._log("Form fields cleared.")
+
+    def _web_fill_and_submit(self):
+        if not self.web_driver:
+            self._log("Launch a browser first.")
+            return
+        if not self.web_form_fields:
+            self._log("No form fields detected. Click 'Detect Forms' first.")
+            return
+
+        def worker():
+            try:
+                for f in self.web_form_fields:
+                    if not f["value"] or not f["locator"]:
+                        continue
+                    ftype = f["type"].lower()
+                    if ftype in ("submit", "button", "hidden"):
+                        continue
+                    try:
+                        el = self._web_find(f["locator"], timeout=5)
+                        self.web_driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});",
+                            el)
+                        time.sleep(0.2)
+                        if ftype in ("checkbox", "radio"):
+                            if not el.is_selected():
+                                el.click()
+                        elif ftype == "select" or f["locator"].startswith(
+                                "css=select") or f["locator"].startswith(
+                                "tag=select"):
+                            from selenium.webdriver.support.ui import Select
+                            Select(el).select_by_visible_text(f["value"])
+                        else:
+                            el.click()
+                            el.clear()
+                            el.send_keys(f["value"])
+                        self._log(f"Filled: {f['field']} = {f['value']}")
+                    except Exception as e:
+                        self._log(f"Fill error ({f['field']}): {e}")
+
+                if self.web_form_confirm_var.get():
+                    result = [None]
+                    event = threading.Event()
+
+                    def ask():
+                        result[0] = messagebox.askyesno(
+                            "Confirm Submit",
+                            "All fields filled. Submit the form?")
+                        event.set()
+
+                    self.after(0, ask)
+                    event.wait()
+                    if not result[0]:
+                        self._log("Submit cancelled by user.")
+                        return
+
+                try:
+                    form = self.web_driver.execute_script(
+                        "return document.querySelector('form');")
+                    if form:
+                        form.submit()
+                        self._log("Form submitted.")
+                    else:
+                        self._log("No <form> element found to submit.")
+                except Exception as e:
+                    self._log(f"Submit error: {e}")
+            except Exception as e:
+                self._log(f"Fill & Submit error: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _web_refresh_form_tree(self):
+        for item in self.web_form_tree.get_children():
+            self.web_form_tree.delete(item)
+        for f in self.web_form_fields:
+            self.web_form_tree.insert("", "end", values=(
+                f["field"], f["type"], f["locator"], f["value"]))
+
+    # -- Scraper methods --
+
+    def _web_scrape_text(self):
+        if not self.web_driver:
+            self._log("Launch a browser first.")
+            return
+        sel = self.web_scrape_selector_var.get().strip()
+        if not sel:
+            self._log("Enter a CSS selector.")
+            return
+        try:
+            by, val = self._web_parse_locator(f"css={sel}")
+            elements = self.web_driver.find_elements(by, val)
+            url = self.web_driver.current_url
+            for el in elements:
+                txt = el.text.strip()
+                if txt:
+                    self.web_scraped_data.append({
+                        "source": url, "selector": sel, "text": txt})
+            self._web_refresh_scrape_tree()
+            self._log(f"Extracted {len(elements)} element(s) for '{sel}'.")
+        except Exception as e:
+            self._log(f"Scrape text error: {e}")
+
+    def _web_scrape_table(self):
+        if not self.web_driver:
+            self._log("Launch a browser first.")
+            return
+        sel = self.web_scrape_selector_var.get().strip() or "table"
+        try:
+            by, val = self._web_parse_locator(f"css={sel}")
+            table = self.web_driver.find_element(by, val)
+            rows = table.find_elements(By.TAG_NAME, "tr")
+            url = self.web_driver.current_url
+            count = 0
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if not cells:
+                    cells = row.find_elements(By.TAG_NAME, "th")
+                cell_texts = [c.text.strip() for c in cells]
+                row_text = " | ".join(cell_texts)
+                if row_text.strip():
+                    self.web_scraped_data.append({
+                        "source": url, "selector": sel, "text": row_text})
+                    count += 1
+            self._web_refresh_scrape_tree()
+            self._log(f"Extracted {count} row(s) from table '{sel}'.")
+        except Exception as e:
+            self._log(f"Scrape table error: {e}")
+
+    def _web_compare_pages(self):
+        if not self.web_driver:
+            self._log("Launch a browser first.")
+            return
+        urls_text = self.web_compare_urls.get("0.0", "end").strip()
+        urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+        sel = self.web_compare_sel_var.get().strip()
+        if not urls:
+            self._log("Enter at least one URL to compare.")
+            return
+        if not sel:
+            self._log("Enter a CSS selector for comparison.")
+            return
+
+        def worker():
+            self._log(f"Comparing {len(urls)} page(s) with selector '{sel}'...")
+            for url in urls:
+                try:
+                    self.web_driver.get(url)
+                    time.sleep(1.5)
+                    by, val = self._web_parse_locator(f"css={sel}")
+                    elements = self.web_driver.find_elements(by, val)
+                    for el in elements:
+                        txt = el.text.strip()
+                        if txt:
+                            self.web_scraped_data.append({
+                                "source": url, "selector": sel, "text": txt})
+                    self.after(0, self._web_refresh_scrape_tree)
+                except Exception as e:
+                    self._log(f"Compare error ({url}): {e}")
+            self._log("Page comparison done.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _web_export_csv(self):
+        if not self.web_scraped_data:
+            self._log("No scraped data to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["source", "selector", "text"])
+                writer.writeheader()
+                writer.writerows(self.web_scraped_data)
+            self._log(f"Exported {len(self.web_scraped_data)} row(s) to {path}")
+        except Exception as e:
+            self._log(f"CSV export error: {e}")
+
+    def _web_export_json(self):
+        if not self.web_scraped_data:
+            self._log("No scraped data to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.web_scraped_data, f, indent=2, ensure_ascii=False)
+            self._log(f"Exported {len(self.web_scraped_data)} row(s) to {path}")
+        except Exception as e:
+            self._log(f"JSON export error: {e}")
+
+    def _web_clear_scraped(self):
+        self.web_scraped_data = []
+        self._web_refresh_scrape_tree()
+        self._log("Scraped data cleared.")
+
+    def _web_refresh_scrape_tree(self):
+        for item in self.web_scrape_tree.get_children():
+            self.web_scrape_tree.delete(item)
+        for d in self.web_scraped_data:
+            self.web_scrape_tree.insert("", "end", values=(
+                d.get("source", ""), d.get("selector", ""),
+                d.get("text", "")))
 
     # ============================================================
     #  Tab 6: Macro Editor
